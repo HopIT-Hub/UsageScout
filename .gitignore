@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# SwiftPM / build outputs
+.build/
+.swiftpm/
+
+# Xcode / IDE
+DerivedData/
+*.xcworkspace/
+*.xcodeproj/xcuserdata/
+*.xcuserstate
+
+# Release artifacts
+dist/*
+!dist/.gitkeep
+
+# Local env / secrets
+.env
+.env.*
+*.p12
+*.mobileprovision
