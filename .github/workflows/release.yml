@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive release metadata
+        shell: bash
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME}"
+          VERSION="${TAG_NAME#v}"
+          BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=${BUILD_NUMBER}" >> "$GITHUB_ENV"
+
+      - name: Build release package
+        shell: bash
+        run: |
+          ./scripts/build_release_app.sh "${VERSION}" "${BUILD_NUMBER}"
+
+      - name: Sign and notarize (optional)
+        if: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_BASE64 != '' && secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD != '' && secrets.APPLE_DEVELOPER_ID_APPLICATION_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
+        shell: bash
+        env:
+          CERT_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_BASE64 }}
+          CERT_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+
+          echo "$CERT_P12_BASE64" | base64 -D > "$CERT_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$CERT_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" dist/UsageScout.app
+          codesign --verify --deep --strict --verbose=2 dist/UsageScout.app
+          spctl --assess --type execute --verbose dist/UsageScout.app || true
+
+          ditto -c -k --sequesterRsrc --keepParent dist/UsageScout.app dist/UsageScout-macOS.zip
+          xcrun notarytool submit dist/UsageScout-macOS.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+          xcrun stapler staple dist/UsageScout.app
+          ditto -c -k --sequesterRsrc --keepParent dist/UsageScout.app dist/UsageScout-macOS.zip
+
+          security delete-keychain "$KEYCHAIN_PATH"
+
+      - name: Generate checksum
+        shell: bash
+        run: |
+          shasum -a 256 dist/UsageScout-macOS.zip > dist/UsageScout-macOS.zip.sha256
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: UsageScout-${{ env.TAG_NAME }}
+          path: |
+            dist/UsageScout.app
+            dist/UsageScout-macOS.zip
+            dist/UsageScout-macOS.zip.sha256
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: UsageScout ${{ env.TAG_NAME }}
+          generate_release_notes: true
+          files: |
+            dist/UsageScout-macOS.zip
+            dist/UsageScout-macOS.zip.sha256

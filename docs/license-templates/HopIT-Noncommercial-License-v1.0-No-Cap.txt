@@ -1,4 +1,4 @@
-HopIT Noncommercial License v1.0 (Qualified Organization Cap)
+HopIT Noncommercial License v1.0 (No Cap)
 
 Copyright (c) 2026 HopIT (https://hopit.co)
 
@@ -8,25 +8,13 @@ TERMS AND CONDITIONS
 
 1. Definitions
 
-   "Software" means the UsageScout source code, binaries, documentation,
-   and all associated files in this repository.
+   "Software" means the source code, binaries, documentation, and all
+   associated files in this repository.
 
    "Internal Use" means running or using the Software for personal or
    internal business purposes where the Software is not distributed to
    end users outside your organization and is not incorporated into a
    product or service offered to others.
-
-   "Organization" means an entity and all parent, subsidiary, and
-   affiliate entities under common control.
-
-   "Worker" means any employee, contractor, consultant, intern, or
-   temporary worker of an Organization.
-
-   "Annual Gross Revenue" means consolidated annual gross revenue of an
-   Organization.
-
-   "Qualified Organization" means an Organization with fewer than
-   150 Workers and less than USD 100,000,000 Annual Gross Revenue.
 
    "Commercial Distribution" means distributing, selling, licensing,
    sublicensing, or providing access to the Software (or any product,
@@ -44,8 +32,8 @@ TERMS AND CONDITIONS
 
    a. Use and run the Software for any noncommercial purpose.
 
-   b. Use, run, and modify the Software for Internal Use in a
-      Qualified Organization.
+   b. Use, run, and modify the Software for Internal Use in a personal
+      or commercial/professional setting.
 
    c. Modify the Software and create derivative works.
 
@@ -62,17 +50,14 @@ TERMS AND CONDITIONS
 
    The following require a separate written commercial license from HopIT:
 
-   a. Any Internal Use by an Organization that is not a Qualified
-      Organization.
+   a. Commercial Distribution to third parties.
 
-   b. Commercial Distribution to third parties.
+   b. Closed-Source Distribution.
 
-   c. Closed-Source Distribution.
-
-   d. Removing or obscuring this License, copyright notices, or
+   c. Removing or obscuring this License, copyright notices, or
       attribution required by Section 2(d)(iii).
 
-   e. Using HopIT names/logos, or the original Software name/logo, as
+   d. Using HopIT names/logos, or the original Software name/logo, as
       primary branding for a derivative product.
 
 4. Trademark and Branding

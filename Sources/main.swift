@@ -1,6 +1,7 @@
 import AppKit
 import CommonCrypto
 import Foundation
+import LocalAuthentication
 import Security
 import ServiceManagement
 import SQLite3
@@ -10,6 +11,11 @@ struct AppBrand {
     static let companyName = "HopIT"
     static let settingsFolderName = "UsageScout"
     static let legacySettingsFolderName = "ClaudeMonitor"
+    static let githubRepoOwner = "HopIT-Hub"
+    static let githubRepoName = "UsageScout"
+    static var latestReleaseAPIURL: URL {
+        URL(string: "https://api.github.com/repos/\(githubRepoOwner)/\(githubRepoName)/releases/latest")!
+    }
 }
 
 struct MonitorConfig {
@@ -24,6 +30,7 @@ struct MonitorConfig {
     static let weeklySonnetBillableTokenLimit: Int = 1_500_000
     static let dashboardRequestTimeoutSeconds: TimeInterval = 10
     static let dashboardAutoExtractCooldownSeconds: TimeInterval = 900
+    static let updateCheckIntervalSeconds: TimeInterval = 21_600
 }
 
 struct TokenUsage {
@@ -84,7 +91,24 @@ struct MonitorSettings: Codable {
     var sessionKey: String?
     var cookieHeader: String?
     var orgUUID: String?
+    var dashboardAuthEnabled: Bool?
     var startAtLoginEnabled: Bool?
+    var sessionResetCalibrationISO8601: String?
+    var weeklyResetCalibrationISO8601: String?
+}
+
+struct GitHubLatestRelease: Decodable {
+    let tagName: String
+    let htmlURL: String
+    let draft: Bool
+    let prerelease: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case tagName = "tag_name"
+        case htmlURL = "html_url"
+        case draft
+        case prerelease
+    }
 }
 
 final class MonitorSettingsStore {
@@ -479,7 +503,7 @@ enum ClaudeDesktopCredentialExtractor {
             kSecAttrService as String: service,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIAllow
+            kSecUseAuthenticationContext as String: makeKeychainContext()
         ]
         if let account {
             query[kSecAttrAccount as String] = account
@@ -500,7 +524,7 @@ enum ClaudeDesktopCredentialExtractor {
             kSecReturnData as String: true,
             kSecReturnAttributes as String: true,
             kSecMatchLimit as String: kSecMatchLimitAll,
-            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIAllow
+            kSecUseAuthenticationContext as String: makeKeychainContext()
         ]
 
         var item: CFTypeRef?
@@ -545,6 +569,12 @@ enum ClaudeDesktopCredentialExtractor {
         }
 
         return results
+    }
+
+    private static func makeKeychainContext() -> LAContext {
+        let context = LAContext()
+        context.interactionNotAllowed = false
+        return context
     }
 
     private static func deriveChromiumAESKeys(password: String) -> [Data] {
@@ -763,7 +793,7 @@ final class ClaudeUsageService {
     }
 
     func collectSnapshot(now: Date = Date()) -> UsageSnapshot {
-        if let dashboard = fetchDashboardUsage() {
+        if dashboardAuthModeEnabled(), let dashboard = fetchDashboardUsage() {
             let weekWindow = weeklyWindow(now: now)
             return UsageSnapshot(
                 generatedAt: now,
@@ -784,12 +814,18 @@ final class ClaudeUsageService {
         return collectLocalSnapshot(now: now)
     }
 
+    private func dashboardAuthModeEnabled() -> Bool {
+        let settings = settingsStore.load()
+        return settings.dashboardAuthEnabled ?? false
+    }
+
     private func collectLocalSnapshot(now: Date) -> UsageSnapshot {
+        let settings = settingsStore.load()
         let sourceRoot = URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent(".claude")
             .appendingPathComponent("projects")
 
-        let weekWindow = weeklyWindow(now: now)
+        let weekWindow = weeklyWindow(now: now, settings: settings)
         let files = candidateJSONLFiles(
             sourceRoot: sourceRoot,
             weeklyStart: weekWindow.start
@@ -840,7 +876,11 @@ final class ClaudeUsageService {
 
         let sessionSummaries = sessions.values.map { $0.toSummary() }
         let currentSession = sessionSummaries.max(by: { $0.lastEvent < $1.lastEvent })
-        let sessionResetAt = currentSession.map { nextSessionReset(anchor: $0.firstEvent, now: now) }
+        let sessionResetAt = calibratedResetDate(
+            fromISO8601: settings.sessionResetCalibrationISO8601,
+            intervalSeconds: TimeInterval(MonitorConfig.sessionWindowHours * 3_600),
+            now: now
+        ) ?? currentSession.map { nextSessionReset(anchor: $0.firstEvent, now: now) }
         let weeklySessionCount = sessionSummaries.filter {
             $0.lastEvent >= weekWindow.start && $0.firstEvent < weekWindow.nextReset
         }.count
@@ -1278,7 +1318,18 @@ final class ClaudeUsageService {
         return anchor.addingTimeInterval(TimeInterval(nextWindow) * interval)
     }
 
-    private func weeklyWindow(now: Date) -> (start: Date, nextReset: Date) {
+    private func weeklyWindow(now: Date, settings: MonitorSettings? = nil) -> (start: Date, nextReset: Date) {
+        if let weeklyCalibration = calibratedResetDate(
+            fromISO8601: settings?.weeklyResetCalibrationISO8601,
+            intervalSeconds: 7 * 86_400,
+            now: now
+        ) {
+            return (
+                start: weeklyCalibration.addingTimeInterval(-7 * 86_400),
+                nextReset: weeklyCalibration
+            )
+        }
+
         var calendar = Calendar.current
         calendar.timeZone = TimeZone.current
 
@@ -1303,6 +1354,27 @@ final class ClaudeUsageService {
 
         let next = calendar.date(byAdding: .day, value: 7, to: resetCandidate) ?? resetCandidate
         return (start: resetCandidate, nextReset: next)
+    }
+
+    private func calibratedResetDate(
+        fromISO8601 value: String?,
+        intervalSeconds: TimeInterval,
+        now: Date
+    ) -> Date? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty,
+              intervalSeconds > 0,
+              let base = parseTimestamp(value) else {
+            return nil
+        }
+
+        if base > now {
+            return base
+        }
+
+        let elapsed = now.timeIntervalSince(base)
+        let intervalsToAdvance = Int(elapsed / intervalSeconds) + 1
+        return base.addingTimeInterval(Double(intervalsToAdvance) * intervalSeconds)
     }
 }
 
@@ -1354,7 +1426,12 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
     private let queue = DispatchQueue(label: "\(AppBrand.appName).Refresh", qos: .utility)
 
     private var refreshTimer: Timer?
+    private var updateCheckTimer: Timer?
     private var snapshot: UsageSnapshot?
+    private var latestAvailableVersion: String?
+    private var latestReleaseURL: URL?
+    private var isCheckingForUpdates = false
+    private let lastNotifiedVersionKey = "\(AppBrand.appName).LastNotifiedVersion"
 
     private let absoluteDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -1376,11 +1453,51 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         return formatter
     }()
 
+    private let iso8601StorageFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+
+    private lazy var calibrationInputFormatters: [DateFormatter] = {
+        var formatters: [DateFormatter] = []
+
+        let localized = DateFormatter()
+        localized.locale = Locale.current
+        localized.dateStyle = .medium
+        localized.timeStyle = .short
+        formatters.append(localized)
+
+        for pattern in [
+            "yyyy-MM-dd HH:mm",
+            "yyyy-MM-dd h:mm a",
+            "yyyy/MM/dd HH:mm",
+            "yyyy/MM/dd h:mm a",
+            "M/d/yyyy h:mm a",
+            "M/d/yyyy HH:mm",
+            "MMM d, yyyy h:mm a"
+        ] {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone.current
+            formatter.dateFormat = pattern
+            formatters.append(formatter)
+        }
+
+        return formatters
+    }()
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        statusItem.button?.title = "\(AppBrand.appName) --"
+        if let button = statusItem.button {
+            button.imagePosition = .imageLeading
+            button.imageScaling = .scaleProportionallyDown
+            button.image = statusProgressImage(nil)
+            button.title = "--"
+        }
         applySavedStartAtLoginPreference()
         refreshData()
+        checkForUpdates(userInitiated: false)
 
         refreshTimer = Timer.scheduledTimer(
             withTimeInterval: MonitorConfig.refreshIntervalSeconds,
@@ -1388,10 +1505,27 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         ) { [weak self] _ in
             self?.refreshData()
         }
+
+        updateCheckTimer = Timer.scheduledTimer(
+            withTimeInterval: MonitorConfig.updateCheckIntervalSeconds,
+            repeats: true
+        ) { [weak self] _ in
+            self?.checkForUpdates(userInitiated: false)
+        }
     }
 
     @objc private func refreshNowAction(_ sender: Any?) {
         refreshData()
+    }
+
+    @objc private func checkForUpdatesAction(_ sender: Any?) {
+        if let releaseURL = latestReleaseURL,
+           let latest = latestAvailableVersion,
+           isVersion(latest, greaterThan: currentAppVersion()) {
+            NSWorkspace.shared.open(releaseURL)
+            return
+        }
+        checkForUpdates(userInitiated: true)
     }
 
     @objc private func openDataFolderAction(_ sender: Any?) {
@@ -1477,6 +1611,44 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         refreshData()
     }
 
+    @objc private func toggleDashboardAuthModeAction(_ sender: Any?) {
+        var settings = settingsStore.load()
+        let nextValue = !(settings.dashboardAuthEnabled ?? false)
+
+        if nextValue {
+            NSApp.activate(ignoringOtherApps: true)
+
+            let warning = NSAlert()
+            warning.messageText = "Dashboard Auth May Violate Terms"
+            warning.informativeText = "UsageScout has not received written Anthropic approval for dashboard API usage. We do not recommend enabling Dashboard Auth mode at this time.\n\nEnable anyway at your own risk?"
+            warning.alertStyle = .warning
+            warning.addButton(withTitle: "Enable Anyway")
+            warning.addButton(withTitle: "Cancel")
+
+            let response = warning.runModal()
+            guard response == .alertFirstButtonReturn else {
+                return
+            }
+        }
+
+        settings.dashboardAuthEnabled = nextValue
+        settingsStore.save(settings)
+
+        if nextValue {
+            showAlert(
+                title: "Dashboard Auth Enabled",
+                message: "UsageScout will now attempt dashboard API reads when credentials are available. Use this mode at your own risk."
+            )
+        } else {
+            showAlert(
+                title: "Cache-Only Mode Enabled",
+                message: "UsageScout will now use local cache/log data only."
+            )
+        }
+
+        refreshData()
+    }
+
     @objc private func enterSessionKeyAction(_ sender: Any?) {
         let existing = settingsStore.load().sessionKey ?? ""
         guard let sessionKey = promptForText(
@@ -1558,6 +1730,86 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         refreshData()
     }
 
+    @objc private func setSessionResetCalibrationAction(_ sender: Any?) {
+        var settings = settingsStore.load()
+        let defaultDate = parsedStoredDate(settings.sessionResetCalibrationISO8601)
+            ?? snapshot?.sessionResetAt
+            ?? Date().addingTimeInterval(TimeInterval(MonitorConfig.sessionWindowHours * 3_600))
+        let defaultValue = absoluteDateFormatter.string(from: defaultDate)
+
+        guard let input = promptForText(
+            title: "Set Session Reset Time",
+            message: "Enter the next session reset time from your dashboard. Example: \(defaultValue)",
+            placeholder: "YYYY-MM-DD HH:MM (local time)",
+            defaultValue: defaultValue,
+            secure: false
+        ) else {
+            return
+        }
+
+        guard let parsed = parseCalibrationDateInput(input) else {
+            showAlert(
+                title: "Invalid Date/Time",
+                message: "Could not parse that value. Use a local date/time like 2026-02-27 20:00."
+            )
+            return
+        }
+
+        settings.sessionResetCalibrationISO8601 = iso8601StorageFormatter.string(from: parsed)
+        settingsStore.save(settings)
+        showAlert(
+            title: "Session Calibration Saved",
+            message: "Local/cache mode will anchor session reset timing to \(absoluteDateFormatter.string(from: parsed))."
+        )
+        refreshData()
+    }
+
+    @objc private func setWeeklyResetCalibrationAction(_ sender: Any?) {
+        var settings = settingsStore.load()
+        let defaultDate = parsedStoredDate(settings.weeklyResetCalibrationISO8601)
+            ?? snapshot?.weeklyResetAt
+            ?? Date().addingTimeInterval(7 * 86_400)
+        let defaultValue = absoluteDateFormatter.string(from: defaultDate)
+
+        guard let input = promptForText(
+            title: "Set Weekly Reset Time",
+            message: "Enter the next weekly reset time from your dashboard. Example: \(defaultValue)",
+            placeholder: "YYYY-MM-DD HH:MM (local time)",
+            defaultValue: defaultValue,
+            secure: false
+        ) else {
+            return
+        }
+
+        guard let parsed = parseCalibrationDateInput(input) else {
+            showAlert(
+                title: "Invalid Date/Time",
+                message: "Could not parse that value. Use a local date/time like 2026-02-27 20:00."
+            )
+            return
+        }
+
+        settings.weeklyResetCalibrationISO8601 = iso8601StorageFormatter.string(from: parsed)
+        settingsStore.save(settings)
+        showAlert(
+            title: "Weekly Calibration Saved",
+            message: "Local/cache mode will anchor weekly reset timing to \(absoluteDateFormatter.string(from: parsed))."
+        )
+        refreshData()
+    }
+
+    @objc private func clearResetCalibrationsAction(_ sender: Any?) {
+        var settings = settingsStore.load()
+        settings.sessionResetCalibrationISO8601 = nil
+        settings.weeklyResetCalibrationISO8601 = nil
+        settingsStore.save(settings)
+        showAlert(
+            title: "Reset Calibrations Cleared",
+            message: "UsageScout reverted to inferred local reset timing."
+        )
+        refreshData()
+    }
+
     private func refreshData() {
         queue.async { [weak self] in
             guard let self else { return }
@@ -1603,9 +1855,11 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
             )
 
         if snapshot.dashboard?.fiveHour != nil || snapshot.session != nil {
-            statusItem.button?.title = "\(progressCircle(sessionRatio)) \(percentText(sessionRatio))"
+            statusItem.button?.image = statusProgressImage(sessionRatio)
+            statusItem.button?.title = percentText(sessionRatio)
         } else {
-            statusItem.button?.title = "○ --"
+            statusItem.button?.image = statusProgressImage(nil)
+            statusItem.button?.title = "--"
         }
 
         let menu = NSMenu()
@@ -1689,6 +1943,14 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         let authItem = NSMenuItem(title: "Dashboard Auth", action: nil, keyEquivalent: "")
         let authMenu = NSMenu(title: "Dashboard Auth")
 
+        let dashboardModeEnabled = settings.dashboardAuthEnabled ?? false
+        let modeItem = NSMenuItem(title: "Use Dashboard Auth Mode", action: #selector(toggleDashboardAuthModeAction(_:)), keyEquivalent: "")
+        modeItem.target = self
+        modeItem.state = dashboardModeEnabled ? .on : .off
+        authMenu.addItem(modeItem)
+        authMenu.addItem(disabledItem(dashboardModeEnabled ? "Mode: dashboard auth enabled" : "Mode: cache-only (default)"))
+        authMenu.addItem(.separator())
+
         let autoExtractItem = NSMenuItem(title: "Auto Extract from Claude Desktop", action: #selector(autoExtractDashboardAuthAction(_:)), keyEquivalent: "")
         autoExtractItem.target = self
         authMenu.addItem(autoExtractItem)
@@ -1714,6 +1976,37 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         authItem.submenu = authMenu
         menu.addItem(authItem)
 
+        let calibrationItem = NSMenuItem(title: "Reset Calibration", action: nil, keyEquivalent: "")
+        let calibrationMenu = NSMenu(title: "Reset Calibration")
+        if dashboardModeEnabled {
+            calibrationMenu.addItem(disabledItem("Disable Dashboard Auth mode to calibrate local reset anchors."))
+        } else {
+            calibrationMenu.addItem(disabledItem("Local/cache mode only"))
+            if let sessionCalibration = parsedStoredDate(settings.sessionResetCalibrationISO8601) {
+                calibrationMenu.addItem(disabledItem("Session anchor: \(absoluteDateFormatter.string(from: sessionCalibration))"))
+            }
+            if let weeklyCalibration = parsedStoredDate(settings.weeklyResetCalibrationISO8601) {
+                calibrationMenu.addItem(disabledItem("Weekly anchor: \(absoluteDateFormatter.string(from: weeklyCalibration))"))
+            }
+            calibrationMenu.addItem(.separator())
+
+            let setSessionItem = NSMenuItem(title: "Set Session Reset Time...", action: #selector(setSessionResetCalibrationAction(_:)), keyEquivalent: "")
+            setSessionItem.target = self
+            calibrationMenu.addItem(setSessionItem)
+
+            let setWeeklyItem = NSMenuItem(title: "Set Weekly Reset Time...", action: #selector(setWeeklyResetCalibrationAction(_:)), keyEquivalent: "")
+            setWeeklyItem.target = self
+            calibrationMenu.addItem(setWeeklyItem)
+
+            calibrationMenu.addItem(.separator())
+            let clearCalibrationsItem = NSMenuItem(title: "Clear Reset Calibration", action: #selector(clearResetCalibrationsAction(_:)), keyEquivalent: "")
+            clearCalibrationsItem.target = self
+            clearCalibrationsItem.isEnabled = settings.sessionResetCalibrationISO8601 != nil || settings.weeklyResetCalibrationISO8601 != nil
+            calibrationMenu.addItem(clearCalibrationsItem)
+        }
+        calibrationItem.submenu = calibrationMenu
+        menu.addItem(calibrationItem)
+
         menu.addItem(.separator())
         let startAtLoginState = startAtLoginManager.currentState()
         let startAtLoginItem = NSMenuItem(
@@ -1730,6 +2023,18 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
+        let updateTitle: String
+        if let latest = latestAvailableVersion,
+           isVersion(latest, greaterThan: currentAppVersion()) {
+            updateTitle = "Update Available: v\(latest)..."
+        } else {
+            updateTitle = "Check for Updates..."
+        }
+        let updateItem = NSMenuItem(title: updateTitle, action: #selector(checkForUpdatesAction(_:)), keyEquivalent: "")
+        updateItem.target = self
+        menu.addItem(updateItem)
+
+        menu.addItem(.separator())
         let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refreshNowAction(_:)), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
@@ -1738,6 +2043,8 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         openItem.target = self
         menu.addItem(openItem)
 
+        menu.addItem(.separator())
+        menu.addItem(disabledItem("Built with \u{2665} by HopIT"))
         menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quitAction(_:)), keyEquivalent: "q")
         quitItem.target = self
@@ -1800,11 +2107,210 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         String(format: "%.0f%%", ratio * 100.0)
     }
 
-    private func progressCircle(_ ratio: Double) -> String {
-        let glyphs = ["○", "◔", "◑", "◕", "●"]
-        let clamped = max(0.0, min(1.0, ratio))
-        let index = Int((clamped * Double(glyphs.count - 1)).rounded())
-        return glyphs[index]
+    private func statusProgressImage(_ ratio: Double?) -> NSImage {
+        let iconSize = NSSize(width: 14, height: 14)
+        let image = NSImage(size: iconSize, flipped: false) { rect in
+            guard let context = NSGraphicsContext.current?.cgContext else {
+                return false
+            }
+
+            context.saveGState()
+            context.setAllowsAntialiasing(true)
+            context.setShouldAntialias(true)
+
+            let frame = rect.insetBy(dx: 1.5, dy: 1.5)
+            let center = CGPoint(x: frame.midX, y: frame.midY)
+            let radius = min(frame.width, frame.height) / 2.0
+            let lineWidth: CGFloat = 1.5
+            let fillRadius = max(0.0, radius - (lineWidth / 2.0))
+
+            context.setStrokeColor(NSColor.black.cgColor)
+            context.setLineWidth(lineWidth)
+            context.strokeEllipse(in: frame)
+
+            if let ratio {
+                let clamped = CGFloat(max(0.0, min(1.0, ratio)))
+                if clamped > 0.0 {
+                    context.setFillColor(NSColor.black.cgColor)
+
+                    if clamped >= 0.999 {
+                        context.fillEllipse(
+                            in: CGRect(
+                                x: center.x - fillRadius,
+                                y: center.y - fillRadius,
+                                width: fillRadius * 2.0,
+                                height: fillRadius * 2.0
+                            )
+                        )
+                    } else {
+                        context.beginPath()
+                        context.move(to: center)
+                        context.addArc(
+                            center: center,
+                            radius: fillRadius,
+                            startAngle: .pi / 2.0,
+                            endAngle: (.pi / 2.0) - (clamped * 2.0 * .pi),
+                            clockwise: true
+                        )
+                        context.closePath()
+                        context.fillPath()
+                    }
+                }
+            }
+
+            context.restoreGState()
+            return true
+        }
+
+        image.isTemplate = true
+        return image
+    }
+
+    private func checkForUpdates(userInitiated: Bool) {
+        guard !isCheckingForUpdates else { return }
+        isCheckingForUpdates = true
+
+        let currentVersion = currentAppVersion()
+        var request = URLRequest(url: AppBrand.latestReleaseAPIURL)
+        request.timeoutInterval = 10
+        request.setValue("\(AppBrand.appName)/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+            guard let self else { return }
+
+            var foundVersion: String?
+            var foundReleaseURL: URL?
+            var checkError: String?
+            var isUpToDate = false
+
+            if let error {
+                checkError = error.localizedDescription
+            } else if let data {
+                do {
+                    let release = try JSONDecoder().decode(GitHubLatestRelease.self, from: data)
+                    if release.draft || release.prerelease {
+                        isUpToDate = true
+                    } else {
+                        let latestVersion = normalizeVersionTag(release.tagName)
+                        if latestVersion.isEmpty {
+                            checkError = "Latest release tag was empty."
+                        } else if isVersion(latestVersion, greaterThan: currentVersion),
+                                  let releaseURL = URL(string: release.htmlURL) {
+                            foundVersion = latestVersion
+                            foundReleaseURL = releaseURL
+                        } else {
+                            isUpToDate = true
+                        }
+                    }
+                } catch {
+                    checkError = "Unable to parse release metadata."
+                }
+            } else {
+                checkError = "No update data returned by GitHub."
+            }
+
+            DispatchQueue.main.async {
+                self.isCheckingForUpdates = false
+
+                if let checkError {
+                    if userInitiated {
+                        self.showAlert(title: "Update Check Failed", message: checkError)
+                    }
+                    return
+                }
+
+                if let foundVersion, let foundReleaseURL {
+                    self.latestAvailableVersion = foundVersion
+                    self.latestReleaseURL = foundReleaseURL
+
+                    let lastNotified = UserDefaults.standard.string(forKey: self.lastNotifiedVersionKey)
+                    if userInitiated || lastNotified != foundVersion {
+                        UserDefaults.standard.set(foundVersion, forKey: self.lastNotifiedVersionKey)
+                        self.showUpdateAvailableAlert(version: foundVersion, releaseURL: foundReleaseURL)
+                    }
+                    if let snapshot = self.snapshot {
+                        self.render(snapshot)
+                    }
+                    return
+                }
+
+                if isUpToDate {
+                    self.latestAvailableVersion = nil
+                    self.latestReleaseURL = nil
+                    if userInitiated {
+                        self.showAlert(title: "You're Up to Date", message: "UsageScout \(currentVersion) is the latest release.")
+                    }
+                    if let snapshot = self.snapshot {
+                        self.render(snapshot)
+                    }
+                }
+            }
+        }.resume()
+    }
+
+    private func currentAppVersion() -> String {
+        let info = Bundle.main.infoDictionary
+        if let short = info?["CFBundleShortVersionString"] as? String,
+           !short.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return short
+        }
+        if let build = info?["CFBundleVersion"] as? String,
+           !build.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return build
+        }
+        return "0.0.0"
+    }
+
+    private func normalizeVersionTag(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("v") || trimmed.hasPrefix("V") {
+            return String(trimmed.dropFirst())
+        }
+        return trimmed
+    }
+
+    private func versionParts(_ value: String) -> [Int] {
+        let normalized = normalizeVersionTag(value)
+        let parts = normalized
+            .split(separator: ".", omittingEmptySubsequences: false)
+            .map { component -> Int in
+                let digits = component.prefix { $0.isNumber }
+                return Int(digits) ?? 0
+            }
+        if parts.isEmpty {
+            return [0]
+        }
+        return parts
+    }
+
+    private func isVersion(_ lhs: String, greaterThan rhs: String) -> Bool {
+        let left = versionParts(lhs)
+        let right = versionParts(rhs)
+        let count = max(left.count, right.count)
+
+        for index in 0..<count {
+            let l = index < left.count ? left[index] : 0
+            let r = index < right.count ? right[index] : 0
+            if l > r { return true }
+            if l < r { return false }
+        }
+        return false
+    }
+
+    private func showUpdateAvailableAlert(version: String, releaseURL: URL) {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "Update Available"
+        alert.informativeText = "UsageScout v\(version) is available."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "View Release")
+        alert.addButton(withTitle: "Later")
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(releaseURL)
+        }
     }
 
     private func progressBar(_ ratio: Double, width: Int = 12) -> String {
@@ -1821,6 +2327,10 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
     }
 
     private func dashboardAuthStatus(settings: MonitorSettings) -> String {
+        if (settings.dashboardAuthEnabled ?? false) == false {
+            return "disabled (cache-only)"
+        }
+
         let env = ProcessInfo.processInfo.environment
         if let fullCookie = env["CLAUDE_COOKIE_HEADER"]?.trimmingCharacters(in: .whitespacesAndNewlines), !fullCookie.isEmpty {
             return "env cookie header"
@@ -1834,7 +2344,33 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         if settings.sessionKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
             return "saved session key"
         }
-        return "not configured (local fallback)"
+        return "enabled, not configured"
+    }
+
+    private func parsedStoredDate(_ value: String?) -> Date? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        return iso8601StorageFormatter.date(from: value)
+    }
+
+    private func parseCalibrationDateInput(_ value: String) -> Date? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        if let iso = iso8601StorageFormatter.date(from: trimmed) {
+            return iso
+        }
+
+        for formatter in calibrationInputFormatters {
+            if let parsed = formatter.date(from: trimmed) {
+                return parsed
+            }
+        }
+
+        return nil
     }
 
     private func promptForText(

@@ -21,6 +21,5 @@ If you do not agree with `CLA.md`, please do not submit code PRs.
 
 All contributions are subject to:
 - `LICENSE`
-- `LICENSE-ADDITIONAL-TERMS.md`
 
-Forks and public variants must preserve required attribution in README and user-accessible UI settings/about areas, per `LICENSE-ADDITIONAL-TERMS.md`.
+Forks and public variants must preserve required attribution in README and user-accessible UI settings/about areas, per `LICENSE`.
