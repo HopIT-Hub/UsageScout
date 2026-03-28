@@ -31,6 +31,8 @@ struct MonitorConfig {
     static let dashboardRequestTimeoutSeconds: TimeInterval = 10
     static let dashboardAutoExtractCooldownSeconds: TimeInterval = 900
     static let updateCheckIntervalSeconds: TimeInterval = 21_600
+    static let claudeStatusCheckIntervalSeconds: TimeInterval = 300
+    static let claudeStatusRequestTimeoutSeconds: TimeInterval = 8
 }
 
 struct TokenUsage {
@@ -95,6 +97,17 @@ struct MonitorSettings: Codable {
     var startAtLoginEnabled: Bool?
     var sessionResetCalibrationISO8601: String?
     var weeklyResetCalibrationISO8601: String?
+    var onboardingCompleted: Bool?
+    var onboardingMode: String?
+}
+
+struct ClaudeStatusResponse: Decodable {
+    struct Status: Decodable {
+        let indicator: String
+        let description: String
+    }
+
+    let status: Status
 }
 
 struct GitHubLatestRelease: Decodable {
@@ -821,17 +834,20 @@ final class ClaudeUsageService {
 
     private func collectLocalSnapshot(now: Date) -> UsageSnapshot {
         let settings = settingsStore.load()
-        let sourceRoot = URL(fileURLWithPath: NSHomeDirectory())
+        let defaultSourceRoot = URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent(".claude")
             .appendingPathComponent("projects")
+        let sourceRoots = localJSONLSourceRoots(defaultRoot: defaultSourceRoot)
+        let primarySourceRoot = sourceRoots.first ?? defaultSourceRoot
 
         let weekWindow = weeklyWindow(now: now, settings: settings)
         let files = candidateJSONLFiles(
-            sourceRoot: sourceRoot,
+            sourceRoots: sourceRoots,
             weeklyStart: weekWindow.start
         )
 
         var sessions: [String: MutableSession] = [:]
+        var eventsBySession: [String: [UsageEvent]] = [:]
         var weeklyAllUsage = TokenUsage()
         var weeklySonnetUsage = TokenUsage()
         var seenUsageKeys = Set<String>()
@@ -849,6 +865,16 @@ final class ClaudeUsageService {
                     }
                 }
 
+                let normalizedEvent = UsageEvent(
+                    sessionId: event.sessionId,
+                    timestamp: event.timestamp,
+                    usage: normalizedUsage,
+                    countsAsMessage: event.countsAsMessage,
+                    usageDedupKey: event.usageDedupKey,
+                    model: event.model
+                )
+                eventsBySession[event.sessionId, default: []].append(normalizedEvent)
+
                 if sessions[event.sessionId] == nil {
                     sessions[event.sessionId] = MutableSession(
                         id: event.sessionId,
@@ -858,16 +884,12 @@ final class ClaudeUsageService {
                 }
 
                 guard var session = sessions[event.sessionId] else { continue }
-                session.absorb(
-                    timestamp: event.timestamp,
-                    usage: normalizedUsage,
-                    countsAsMessage: event.countsAsMessage
-                )
+                session.absorb(timestamp: normalizedEvent.timestamp, usage: normalizedEvent.usage, countsAsMessage: normalizedEvent.countsAsMessage)
                 sessions[event.sessionId] = session
 
-                if event.timestamp >= weekWindow.start && event.timestamp < weekWindow.nextReset {
+                if normalizedEvent.timestamp >= weekWindow.start && normalizedEvent.timestamp < weekWindow.nextReset {
                     weeklyAllUsage.add(normalizedUsage)
-                    if let model = event.model?.lowercased(), model.contains("sonnet") {
+                    if let model = normalizedEvent.model?.lowercased(), model.contains("sonnet") {
                         weeklySonnetUsage.add(normalizedUsage)
                     }
                 }
@@ -881,13 +903,35 @@ final class ClaudeUsageService {
             intervalSeconds: TimeInterval(MonitorConfig.sessionWindowHours * 3_600),
             now: now
         ) ?? currentSession.map { nextSessionReset(anchor: $0.firstEvent, now: now) }
+        let currentWindowedSession: SessionSummary? = {
+            guard let base = currentSession else { return nil }
+            guard let reset = sessionResetAt else { return base }
+            let interval = TimeInterval(MonitorConfig.sessionWindowHours * 3_600)
+            let windowStart = reset.addingTimeInterval(-interval)
+            guard let events = eventsBySession[base.id] else { return base }
+
+            var usage = TokenUsage()
+            var messageCount = 0
+            for event in events where event.timestamp >= windowStart && event.timestamp < reset {
+                usage.add(event.usage)
+                if event.countsAsMessage { messageCount += 1 }
+            }
+
+            return SessionSummary(
+                id: base.id,
+                firstEvent: base.firstEvent,
+                lastEvent: base.lastEvent,
+                usage: usage,
+                messageCount: messageCount
+            )
+        }()
         let weeklySessionCount = sessionSummaries.filter {
             $0.lastEvent >= weekWindow.start && $0.firstEvent < weekWindow.nextReset
         }.count
 
         return UsageSnapshot(
             generatedAt: now,
-            session: currentSession,
+            session: currentWindowedSession,
             sessionResetAt: sessionResetAt,
             weeklyAllUsage: weeklyAllUsage,
             weeklySonnetUsage: weeklySonnetUsage,
@@ -895,9 +939,9 @@ final class ClaudeUsageService {
             weeklyStart: weekWindow.start,
             weeklyResetAt: weekWindow.nextReset,
             scannedFileCount: files.count,
-            sourcePath: sourceRoot.path,
+            sourcePath: primarySourceRoot.path,
             dashboard: nil,
-            sourceDescription: "Local CLI logs (approximate)"
+            sourceDescription: "Local cache logs (approximate)"
         )
     }
 
@@ -1164,24 +1208,54 @@ final class ClaudeUsageService {
         UUID(uuidString: value) != nil
     }
 
-    private func candidateJSONLFiles(sourceRoot: URL, weeklyStart: Date) -> [URL] {
-        guard let enumerator = fileManager.enumerator(
-            at: sourceRoot,
-            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
-            options: [.skipsHiddenFiles],
-            errorHandler: { _, _ in true }
-        ) else {
-            return []
+    private func localJSONLSourceRoots(defaultRoot: URL) -> [URL] {
+        let home = URL(fileURLWithPath: NSHomeDirectory())
+        let localAgentRoot = home
+            .appendingPathComponent("Library")
+            .appendingPathComponent("Application Support")
+            .appendingPathComponent("Claude")
+            .appendingPathComponent("local-agent-mode-sessions")
+
+        let candidates = [defaultRoot, localAgentRoot]
+        var roots: [URL] = []
+        for candidate in candidates where fileManager.fileExists(atPath: candidate.path) {
+            roots.append(candidate)
+        }
+        return roots
+    }
+
+    private func shouldIncludeJSONLFile(_ fileURL: URL, sourceRoot: URL) -> Bool {
+        if sourceRoot.lastPathComponent == "projects" {
+            return true
         }
 
+        // In Claude Desktop local-agent sessions, include embedded .claude/projects logs
+        // and per-session audit logs that carry top-level usage summaries.
+        return fileURL.path.contains("/.claude/projects/") || fileURL.lastPathComponent == "audit.jsonl"
+    }
+
+    private func candidateJSONLFiles(sourceRoots: [URL], weeklyStart: Date) -> [URL] {
         var candidates: [(url: URL, modified: Date)] = []
-        for case let fileURL as URL in enumerator {
-            guard fileURL.pathExtension == "jsonl" else { continue }
-            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]),
-                  values.isRegularFile == true else {
+
+        for sourceRoot in sourceRoots {
+            guard let enumerator = fileManager.enumerator(
+                at: sourceRoot,
+                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+                options: [],
+                errorHandler: { _, _ in true }
+            ) else {
                 continue
             }
-            candidates.append((fileURL, values.contentModificationDate ?? .distantPast))
+
+            for case let fileURL as URL in enumerator {
+                guard fileURL.pathExtension == "jsonl" else { continue }
+                guard shouldIncludeJSONLFile(fileURL, sourceRoot: sourceRoot) else { continue }
+                guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]),
+                      values.isRegularFile == true else {
+                    continue
+                }
+                candidates.append((fileURL, values.contentModificationDate ?? .distantPast))
+            }
         }
 
         let sortedByRecent = candidates.sorted { $0.modified > $1.modified }
@@ -1208,8 +1282,8 @@ final class ClaudeUsageService {
             return nil
         }
 
-        guard let sessionId = object["sessionId"] as? String,
-              let timestampString = object["timestamp"] as? String,
+        guard let sessionId = (object["sessionId"] as? String) ?? (object["session_id"] as? String),
+              let timestampString = (object["timestamp"] as? String) ?? (object["_audit_timestamp"] as? String),
               let timestamp = parseTimestamp(timestampString) else {
             return nil
         }
@@ -1231,8 +1305,18 @@ final class ClaudeUsageService {
     }
 
     private func extractUsage(from object: [String: Any]) -> TokenUsage {
-        guard let message = object["message"] as? [String: Any],
-              let usageDict = message["usage"] as? [String: Any] else {
+        let usageDict: [String: Any]?
+        if let message = object["message"] as? [String: Any],
+           let messageUsage = message["usage"] as? [String: Any] {
+            usageDict = messageUsage
+        } else if (object["type"] as? String) == "result",
+                  let topLevelUsage = object["usage"] as? [String: Any] {
+            usageDict = topLevelUsage
+        } else {
+            usageDict = nil
+        }
+
+        guard let usageDict else {
             return TokenUsage()
         }
 
@@ -1293,6 +1377,7 @@ final class ClaudeUsageService {
            let messageId = message["id"] as? String {
             return "\(sessionId)|\(requestId)|\(messageId)"
         }
+
         if let uuid = object["uuid"] as? String {
             return "\(sessionId)|\(uuid)"
         }
@@ -1419,6 +1504,23 @@ private struct MutableSession {
 }
 
 final class MenuBarController: NSObject, NSApplicationDelegate {
+    private enum WizardDialogActionStyle {
+        case primary
+        case secondary
+    }
+
+    private struct WizardDialogAction {
+        let title: String
+        let style: WizardDialogActionStyle
+    }
+
+    private enum UserProfile: Equatable {
+        case api
+        case planDashboard
+        case planCache
+        case unknown
+    }
+
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let settingsStore = MonitorSettingsStore()
     private let startAtLoginManager = StartAtLoginManager()
@@ -1427,10 +1529,14 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
 
     private var refreshTimer: Timer?
     private var updateCheckTimer: Timer?
+    private var claudeStatusTimer: Timer?
     private var snapshot: UsageSnapshot?
     private var latestAvailableVersion: String?
     private var latestReleaseURL: URL?
     private var isCheckingForUpdates = false
+    private var isCheckingClaudeStatus = false
+    private var claudeStatusLine = "Claude status: checking..."
+    private var hasPresentedSetupWizardThisLaunch = false
     private let lastNotifiedVersionKey = "\(AppBrand.appName).LastNotifiedVersion"
 
     private let absoluteDateFormatter: DateFormatter = {
@@ -1487,6 +1593,48 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         return formatters
     }()
 
+    private func runWizardDialog(
+        title: String,
+        message: String,
+        detail: String? = nil,
+        actions: [WizardDialogAction]
+    ) -> Int? {
+        guard !actions.isEmpty else { return nil }
+
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+
+        if let detail = detail?.trimmingCharacters(in: .whitespacesAndNewlines), !detail.isEmpty {
+            alert.informativeText = "\(message)\n\n\(detail)"
+        } else {
+            alert.informativeText = message
+        }
+        alert.alertStyle = .informational
+
+        if let appIcon = NSApp.applicationIconImage.copy() as? NSImage {
+            appIcon.size = NSSize(width: 64, height: 64)
+            alert.icon = appIcon
+        }
+
+        var primaryButton: NSButton?
+        for action in actions {
+            let button = alert.addButton(withTitle: action.title)
+            if action.style == .primary, primaryButton == nil {
+                primaryButton = button
+            }
+        }
+        (primaryButton ?? alert.buttons.first)?.keyEquivalent = "\r"
+
+        let response = alert.runModal()
+        let firstRaw = NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+        let index = Int(response.rawValue - firstRaw)
+        guard index >= 0, index < actions.count else {
+            return nil
+        }
+        return index
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         if let button = statusItem.button {
@@ -1497,13 +1645,22 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         }
         applySavedStartAtLoginPreference()
         refreshData()
+        refreshClaudeStatus()
         checkForUpdates(userInitiated: false)
+        presentSetupWizardIfNeeded()
 
         refreshTimer = Timer.scheduledTimer(
             withTimeInterval: MonitorConfig.refreshIntervalSeconds,
             repeats: true
         ) { [weak self] _ in
             self?.refreshData()
+        }
+
+        claudeStatusTimer = Timer.scheduledTimer(
+            withTimeInterval: MonitorConfig.claudeStatusCheckIntervalSeconds,
+            repeats: true
+        ) { [weak self] _ in
+            self?.refreshClaudeStatus()
         }
 
         updateCheckTimer = Timer.scheduledTimer(
@@ -1540,6 +1697,21 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
 
     @objc private func quitAction(_ sender: Any?) {
         NSApp.terminate(nil)
+    }
+
+    @objc private func runSetupWizardAction(_ sender: Any?) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            self?.runSetupWizard(force: true)
+        }
+    }
+
+    @objc private func openClaudeStatusPageAction(_ sender: Any?) {
+        guard let url = URL(string: "https://status.claude.com") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openClaudeUsagePageAction(_ sender: Any?) {
+        _ = openClaudeUsagePageForOrgLookup(showConfirmation: false)
     }
 
     @objc private func toggleStartAtLoginAction(_ sender: Any?) {
@@ -1590,7 +1762,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
             }
             showAlert(
                 title: "Auto Extract Failed",
-                message: reason
+                message: "\(reason)\n\n\(cookieExtractionHelpText())"
             )
             return
         }
@@ -1609,6 +1781,220 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
                 : "Saved session key and org UUID."
         )
         refreshData()
+    }
+
+    private func cookieExtractionHelpText() -> String {
+        let claudeDesktopPath = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library")
+            .appendingPathComponent("Application Support")
+            .appendingPathComponent("Claude")
+            .path
+
+        return "Auto-extract uses Claude Desktop cookies at \(claudeDesktopPath). Install Claude Desktop, sign in, and open it once, then retry.\n\nIf you are CLI-only, use cache-only mode or enter session/cookie values manually."
+    }
+
+    private func presentSetupWizardIfNeeded() {
+        guard !hasPresentedSetupWizardThisLaunch else { return }
+        let settings = settingsStore.load()
+        guard (settings.onboardingCompleted ?? false) == false else { return }
+        hasPresentedSetupWizardThisLaunch = true
+        runSetupWizard(force: false)
+    }
+
+    private func runSetupWizard(force: Bool) {
+        let settings = settingsStore.load()
+        if !force, (settings.onboardingCompleted ?? false) {
+            return
+        }
+
+        let selection = runWizardDialog(
+            title: "How do you use Claude?",
+            message: "Choose your primary usage type for UsageScout setup.",
+            detail: "You can run this again anytime from Dashboard Auth > Setup Wizard.",
+            actions: [
+                WizardDialogAction(title: "API (Pay As You Go)", style: .primary),
+                WizardDialogAction(title: "Plan (Free/Pro/Max)", style: .secondary),
+                WizardDialogAction(title: "Cancel", style: .secondary)
+            ]
+        )
+
+        switch selection {
+        case 0:
+            runAPIOnboarding(existingSettings: settings)
+        case 1:
+            runPlanOnboarding(existingSettings: settings)
+        default:
+            break
+        }
+    }
+
+    private func runAPIOnboarding(existingSettings: MonitorSettings) {
+        while true {
+            let selection = runWizardDialog(
+                title: "API Usage Setup",
+                message: "UsageScout currently reads usage from Claude dashboard data in this mode.",
+                detail: "Next step: paste your org UUID. Click Open Claude Usage Page, then copy the UUID in the request URL segment between /organizations/ and /usage.",
+                actions: [
+                    WizardDialogAction(title: "Continue", style: .primary),
+                    WizardDialogAction(title: "Open Claude Usage Page", style: .secondary),
+                    WizardDialogAction(title: "Cancel", style: .secondary)
+                ]
+            )
+
+            if selection == 1 {
+                _ = openClaudeUsagePageForOrgLookup(showConfirmation: true)
+                return
+            }
+            guard selection == 0 else {
+                return
+            }
+            break
+        }
+
+        guard let orgUUIDInput = promptForText(
+            title: "Enter Org UUID",
+            message: "Paste UUID only. Example: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            defaultValue: existingSettings.orgUUID ?? "",
+            secure: false
+        ) else {
+            return
+        }
+
+        let normalizedOrgUUID = orgUUIDInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard UUID(uuidString: normalizedOrgUUID) != nil else {
+            showAlert(title: "Invalid UUID", message: "Please enter a valid org UUID.")
+            return
+        }
+
+        var settings = settingsStore.load()
+        settings.orgUUID = normalizedOrgUUID
+        settings.dashboardAuthEnabled = true
+        settings.onboardingCompleted = true
+        settings.onboardingMode = "api"
+
+        let extraction = ClaudeDesktopCredentialExtractor.extractDetailed()
+        switch extraction {
+        case .success(let creds):
+            settings.sessionKey = creds.sessionKey
+            settings.cookieHeader = nil
+            settingsStore.save(settings)
+            showAlert(
+                title: "API Setup Complete",
+                message: "Saved org UUID and enabled Dashboard Auth mode. Cookies were auto-extracted from Claude Desktop."
+            )
+        case .failure(let error):
+            settingsStore.save(settings)
+            let reason: String
+            switch error {
+            case .message(let message):
+                reason = message
+            }
+            showAlert(
+                title: "API Setup Saved (Partial)",
+                message: "Saved org UUID and enabled Dashboard Auth mode, but cookie extraction failed.\n\nUse Dashboard Auth menu to add Session Key/Cookie Header.\n\nDetails: \(reason)\n\n\(cookieExtractionHelpText())"
+            )
+        }
+
+        refreshData()
+    }
+
+    private func runPlanOnboarding(existingSettings: MonitorSettings) {
+        let selection = runWizardDialog(
+            title: "Plan Monitoring Options",
+            message: "Monitoring usage may not be ToS compliant. Anthropic has not responded to our request for clarification.",
+            actions: [
+                WizardDialogAction(title: "Extract Cookies (Dashboard Auth)", style: .primary),
+                WizardDialogAction(title: "Use ToS Compliant Cache Monitoring", style: .secondary),
+                WizardDialogAction(title: "Cancel", style: .secondary)
+            ]
+        )
+
+        switch selection {
+        case 0:
+            var settings = settingsStore.load()
+            let extraction = ClaudeDesktopCredentialExtractor.extractDetailed()
+            switch extraction {
+            case .success(let creds):
+                settings.sessionKey = creds.sessionKey
+                settings.cookieHeader = nil
+                if let org = creds.orgUUID {
+                    settings.orgUUID = org
+                }
+                settings.dashboardAuthEnabled = true
+                settings.onboardingCompleted = true
+                settings.onboardingMode = "plan_dashboard"
+                settingsStore.save(settings)
+                showAlert(
+                    title: "Dashboard Auth Enabled",
+                    message: "Cookies were auto-extracted from Claude Desktop."
+                )
+            case .failure(let error):
+                let reason: String
+                switch error {
+                case .message(let message):
+                    reason = message
+                }
+                showAlert(
+                    title: "Cookie Extraction Failed",
+                    message: "UsageScout stayed in cache-only mode.\n\nYou can retry from Dashboard Auth > Setup Wizard.\n\nDetails: \(reason)\n\n\(cookieExtractionHelpText())"
+                )
+            }
+        case 1:
+            var settings = settingsStore.load()
+            settings.dashboardAuthEnabled = false
+            settings.onboardingCompleted = true
+            settings.onboardingMode = "plan_cache"
+            if settings.orgUUID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+                settings.orgUUID = existingSettings.orgUUID
+            }
+            settingsStore.save(settings)
+            showAlert(
+                title: "Cache-Only Mode Enabled",
+                message: "UsageScout will use local cache/log monitoring. This is less accurate, but avoids dashboard auth."
+            )
+        default:
+            break
+        }
+
+        refreshData()
+    }
+
+    private func openClaudeUsagePageForOrgLookup(showConfirmation: Bool = false) -> Bool {
+        let candidates = [
+            "https://claude.ai/settings/usage",
+            "https://claude.ai/settings",
+            "https://claude.ai"
+        ]
+
+        var openedURL: String?
+        for candidate in candidates {
+            guard let url = URL(string: candidate) else { continue }
+            if NSWorkspace.shared.open(url) {
+                openedURL = candidate
+                break
+            }
+        }
+
+        if let openedURL {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(openedURL, forType: .string)
+
+            if showConfirmation {
+                showAlert(
+                    title: "Opened Claude Page",
+                    message: "Opened: \(openedURL)\n\nIf it did not come to front, paste this URL into your browser (already copied to clipboard), then copy org UUID from the request URL segment between /organizations/ and /usage."
+                )
+            }
+            return true
+        }
+
+        showAlert(
+            title: "Unable to Open Claude Page",
+            message: "Please open https://claude.ai/settings/usage manually, then copy org UUID from the request URL segment between /organizations/ and /usage."
+        )
+        return false
     }
 
     @objc private func toggleDashboardAuthModeAction(_ sender: Any?) {
@@ -1935,6 +2321,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         }
         menu.addItem(disabledItem("Updated: \(absoluteDateFormatter.string(from: snapshot.generatedAt))"))
         menu.addItem(disabledItem("Source: \(snapshot.sourceDescription)"))
+        menu.addItem(disabledItem(claudeStatusLine))
 
         let settings = settingsStore.load()
         let authStatus = dashboardAuthStatus(settings: settings)
@@ -1942,45 +2329,89 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
 
         let authItem = NSMenuItem(title: "Dashboard Auth", action: nil, keyEquivalent: "")
         let authMenu = NSMenu(title: "Dashboard Auth")
-
+        let profile = userProfile(from: settings)
         let dashboardModeEnabled = settings.dashboardAuthEnabled ?? false
-        let modeItem = NSMenuItem(title: "Use Dashboard Auth Mode", action: #selector(toggleDashboardAuthModeAction(_:)), keyEquivalent: "")
-        modeItem.target = self
-        modeItem.state = dashboardModeEnabled ? .on : .off
-        authMenu.addItem(modeItem)
-        authMenu.addItem(disabledItem(dashboardModeEnabled ? "Mode: dashboard auth enabled" : "Mode: cache-only (default)"))
-        authMenu.addItem(.separator())
 
-        let autoExtractItem = NSMenuItem(title: "Auto Extract from Claude Desktop", action: #selector(autoExtractDashboardAuthAction(_:)), keyEquivalent: "")
-        autoExtractItem.target = self
-        authMenu.addItem(autoExtractItem)
+        let setupWizardItem = NSMenuItem(title: "Setup Wizard...", action: #selector(runSetupWizardAction(_:)), keyEquivalent: "")
+        setupWizardItem.target = self
+        authMenu.addItem(setupWizardItem)
 
-        let sessionKeyItem = NSMenuItem(title: "Enter Session Key...", action: #selector(enterSessionKeyAction(_:)), keyEquivalent: "")
-        sessionKeyItem.target = self
-        authMenu.addItem(sessionKeyItem)
-
-        let cookieHeaderItem = NSMenuItem(title: "Enter Cookie Header...", action: #selector(enterCookieHeaderAction(_:)), keyEquivalent: "")
-        cookieHeaderItem.target = self
-        authMenu.addItem(cookieHeaderItem)
-
-        let orgUUIDItem = NSMenuItem(title: "Set Org UUID (Optional)...", action: #selector(enterOrgUUIDAction(_:)), keyEquivalent: "")
-        orgUUIDItem.target = self
-        authMenu.addItem(orgUUIDItem)
+        let openUsagePageItem = NSMenuItem(title: "Open Claude Usage Page", action: #selector(openClaudeUsagePageAction(_:)), keyEquivalent: "")
+        openUsagePageItem.target = self
+        authMenu.addItem(openUsagePageItem)
 
         authMenu.addItem(.separator())
-        let clearItem = NSMenuItem(title: "Clear Saved Auth", action: #selector(clearSavedDashboardAuthAction(_:)), keyEquivalent: "")
-        clearItem.target = self
-        clearItem.isEnabled = settings.sessionKey != nil || settings.cookieHeader != nil || settings.orgUUID != nil
-        authMenu.addItem(clearItem)
+
+        let toggleTitle: String
+        if dashboardModeEnabled {
+            toggleTitle = "Disable Dashboard Auth (Use Cache-Only)"
+        } else if profile == .api {
+            toggleTitle = "Enable Dashboard Auth Mode"
+        } else {
+            toggleTitle = "Enable Dashboard Auth (Advanced)"
+        }
+        let toggleItem = NSMenuItem(title: toggleTitle, action: #selector(toggleDashboardAuthModeAction(_:)), keyEquivalent: "")
+        toggleItem.target = self
+        authMenu.addItem(toggleItem)
+
+        switch profile {
+        case .api:
+            authMenu.addItem(disabledItem("Profile: API (Pay As You Go)"))
+        case .planDashboard:
+            authMenu.addItem(disabledItem("Profile: Plan (Dashboard Auth)"))
+        case .planCache:
+            authMenu.addItem(disabledItem("Profile: Plan (Cache-Only)"))
+        case .unknown:
+            authMenu.addItem(disabledItem(dashboardModeEnabled ? "Mode: dashboard auth enabled" : "Mode: cache-only"))
+        }
+
+        if profile == .api {
+            authMenu.addItem(.separator())
+            let updateItem = NSMenuItem(title: "Update API Auth", action: nil, keyEquivalent: "")
+            let updateMenu = NSMenu(title: "Update API Auth")
+
+            let autoExtractItem = NSMenuItem(title: "Auto Extract from Claude Desktop", action: #selector(autoExtractDashboardAuthAction(_:)), keyEquivalent: "")
+            autoExtractItem.target = self
+            updateMenu.addItem(autoExtractItem)
+
+            let sessionKeyItem = NSMenuItem(title: "Enter Session Key...", action: #selector(enterSessionKeyAction(_:)), keyEquivalent: "")
+            sessionKeyItem.target = self
+            updateMenu.addItem(sessionKeyItem)
+
+            let cookieHeaderItem = NSMenuItem(title: "Enter Cookie Header...", action: #selector(enterCookieHeaderAction(_:)), keyEquivalent: "")
+            cookieHeaderItem.target = self
+            updateMenu.addItem(cookieHeaderItem)
+
+            let orgUUIDItem = NSMenuItem(title: "Set Org UUID...", action: #selector(enterOrgUUIDAction(_:)), keyEquivalent: "")
+            orgUUIDItem.target = self
+            updateMenu.addItem(orgUUIDItem)
+
+            updateMenu.addItem(.separator())
+            let clearItem = NSMenuItem(title: "Clear Saved API Auth", action: #selector(clearSavedDashboardAuthAction(_:)), keyEquivalent: "")
+            clearItem.target = self
+            clearItem.isEnabled = settings.sessionKey != nil || settings.cookieHeader != nil || settings.orgUUID != nil
+            updateMenu.addItem(clearItem)
+
+            updateItem.submenu = updateMenu
+            authMenu.addItem(updateItem)
+        } else if dashboardModeEnabled {
+            authMenu.addItem(.separator())
+            let reauthItem = NSMenuItem(title: "Re-auth from Claude Desktop", action: #selector(autoExtractDashboardAuthAction(_:)), keyEquivalent: "")
+            reauthItem.target = self
+            authMenu.addItem(reauthItem)
+
+            let clearItem = NSMenuItem(title: "Clear Saved Dashboard Auth", action: #selector(clearSavedDashboardAuthAction(_:)), keyEquivalent: "")
+            clearItem.target = self
+            clearItem.isEnabled = settings.sessionKey != nil || settings.cookieHeader != nil || settings.orgUUID != nil
+            authMenu.addItem(clearItem)
+        }
 
         authItem.submenu = authMenu
         menu.addItem(authItem)
 
-        let calibrationItem = NSMenuItem(title: "Reset Calibration", action: nil, keyEquivalent: "")
-        let calibrationMenu = NSMenu(title: "Reset Calibration")
-        if dashboardModeEnabled {
-            calibrationMenu.addItem(disabledItem("Disable Dashboard Auth mode to calibrate local reset anchors."))
-        } else {
+        if !dashboardModeEnabled {
+            let calibrationItem = NSMenuItem(title: "Reset Calibration", action: nil, keyEquivalent: "")
+            let calibrationMenu = NSMenu(title: "Reset Calibration")
             calibrationMenu.addItem(disabledItem("Local/cache mode only"))
             if let sessionCalibration = parsedStoredDate(settings.sessionResetCalibrationISO8601) {
                 calibrationMenu.addItem(disabledItem("Session anchor: \(absoluteDateFormatter.string(from: sessionCalibration))"))
@@ -2003,9 +2434,9 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
             clearCalibrationsItem.target = self
             clearCalibrationsItem.isEnabled = settings.sessionResetCalibrationISO8601 != nil || settings.weeklyResetCalibrationISO8601 != nil
             calibrationMenu.addItem(clearCalibrationsItem)
+            calibrationItem.submenu = calibrationMenu
+            menu.addItem(calibrationItem)
         }
-        calibrationItem.submenu = calibrationMenu
-        menu.addItem(calibrationItem)
 
         menu.addItem(.separator())
         let startAtLoginState = startAtLoginManager.currentState()
@@ -2042,6 +2473,10 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         let openItem = NSMenuItem(title: "Open Claude Data Folder", action: #selector(openDataFolderAction(_:)), keyEquivalent: "o")
         openItem.target = self
         menu.addItem(openItem)
+
+        let claudeStatusItem = NSMenuItem(title: "Open Claude Status Page", action: #selector(openClaudeStatusPageAction(_:)), keyEquivalent: "")
+        claudeStatusItem.target = self
+        menu.addItem(claudeStatusItem)
 
         menu.addItem(.separator())
         menu.addItem(disabledItem("Built with \u{2665} by HopIT"))
@@ -2248,6 +2683,47 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         }.resume()
     }
 
+    private func refreshClaudeStatus() {
+        guard !isCheckingClaudeStatus else { return }
+        guard let url = URL(string: "https://status.claude.com/api/v2/status.json") else { return }
+        isCheckingClaudeStatus = true
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = MonitorConfig.claudeStatusRequestTimeoutSeconds
+        request.setValue("\(AppBrand.appName)/\(currentAppVersion())", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+            guard let self else { return }
+
+            let line: String
+            if error != nil {
+                line = "Claude status: unavailable"
+            } else if let data {
+                if let payload = try? JSONDecoder().decode(ClaudeStatusResponse.self, from: data) {
+                    let indicator = payload.status.indicator.lowercased()
+                    let description = payload.status.description.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if indicator == "none" {
+                        line = "Claude status: \(description)"
+                    } else {
+                        line = "Claude status: issue (\(description))"
+                    }
+                } else {
+                    line = "Claude status: unavailable (parse failed)"
+                }
+            } else {
+                line = "Claude status: unavailable"
+            }
+
+            DispatchQueue.main.async {
+                self.isCheckingClaudeStatus = false
+                self.claudeStatusLine = line
+                if let snapshot = self.snapshot {
+                    self.render(snapshot)
+                }
+            }
+        }.resume()
+    }
+
     private func currentAppVersion() -> String {
         let info = Bundle.main.infoDictionary
         if let short = info?["CFBundleShortVersionString"] as? String,
@@ -2345,6 +2821,26 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
             return "saved session key"
         }
         return "enabled, not configured"
+    }
+
+    private func userProfile(from settings: MonitorSettings) -> UserProfile {
+        if let mode = settings.onboardingMode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            switch mode {
+            case "api":
+                return .api
+            case "plan_dashboard":
+                return .planDashboard
+            case "plan_cache":
+                return .planCache
+            default:
+                break
+            }
+        }
+
+        if settings.dashboardAuthEnabled ?? false {
+            return .unknown
+        }
+        return .planCache
     }
 
     private func parsedStoredDate(_ value: String?) -> Date? {

@@ -2,17 +2,13 @@
   <img src="assets/header-image.png" alt="UsageScout — Helping you keep an eye on your Claude usage" width="100%">
 </p>
 
-> [!WARNING]
-> **Compliance Notice (Pre-1.0 release, scoped):**
-> Core UsageScout behavior (local/cache mode) does **not** use Anthropic dashboard endpoints.
-> Potential terms risk is limited to the optional `Dashboard Auth` mode, which reads `/api/organizations/{orgUuid}/usage` using your authenticated session.
-> This risk is most likely relevant to Free/Pro/Max account usage contexts. API-billed org contexts may differ, but written approval for this app workflow is still pending.
-> Keep `Dashboard Auth` disabled unless you understand and accept that risk.
+> <sub>**Compliance Note (Dashboard Auth Only):**</sub>
+> <sub>`Dashboard Auth` mode, which reads `/api/organizations/{orgUuid}/usage` using your authenticated session, is a potential terms violation risk. We still have not received a written response from Anthropic, but other more visible tools appear to use the same mechanism. Our current assumption is Anthropic likely does not object to this approach. You should still treat `Dashboard Auth` as use at your own risk and a potential violation of Anthropic's Terms of Service. Core UsageScout behavior (local/cache mode) does **not** use Anthropic dashboard endpoints, but is significantly less accurate than `Dashboard Auth`.</sub>
 
 <div align="center">
 
 [![Latest Release](https://img.shields.io/github/v/release/HopIT-Hub/UsageScout?style=for-the-badge&color=FF6B2B&label=Latest+Release)](https://github.com/HopIT-Hub/UsageScout/releases/latest)
-![macOS](https://img.shields.io/badge/macOS-13%2B-lightgrey?style=for-the-badge&logo=apple)
+![macOS](https://img.shields.io/badge/macOS-13%2B%20(Apple%20Silicon)-lightgrey?style=for-the-badge&logo=apple)
 [![License](https://img.shields.io/badge/License-HopIT%20Noncommercial%20(Capped)-FF6B2B?style=for-the-badge)](LICENSE)
 [![Ko-Fi](https://img.shields.io/badge/Ko--Fi-Support_the_Project-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/hopit)
 
@@ -33,20 +29,32 @@ UsageScout is a lightweight macOS menu bar app that shows:
 3. Move `UsageScout.app` to `Applications` (or another trusted folder).
 4. Launch `UsageScout.app`.
 
-## Unsigned Install Warning (Temporary)
+Current release binaries are built for Apple Silicon (`arm64`).
 
-Current releases are unsigned/unnotarized while Apple Developer enrollment is in progress.
+## Signed Release Notes
 
-On first launch from a downloaded zip, macOS may block the app. To open:
-- right-click `UsageScout.app` and choose `Open`
-- click `Open` in the warning dialog
-- if needed, go to `System Settings > Privacy & Security` and click `Open Anyway`
+Current release builds are signed and notarized.
 
-Future releases are planned to be signed and notarized.
+If macOS still warns on first launch, verify:
+- app was downloaded from official GitHub release assets
+- you are running the latest release build
+- the downloaded zip was not modified after release
 
 ## First Run
 
 When running, a `UsageScout` item appears in the macOS menu bar.
+
+Setup flow (`Dashboard Auth > Setup Wizard...`):
+1. Choose usage type:
+- `API (Pay As You Go)`, or
+- `Plan (Free/Pro/Max)`
+2. API path:
+- open Claude usage settings (`Open Claude Usage Page`)
+- copy org UUID from request URL (`/organizations/{orgUuid}/usage`)
+- optionally auto-extract desktop cookies for dashboard mode
+3. Plan path:
+- choose dashboard auth extraction, or
+- choose ToS-compliant local/cache mode (less accurate)
 
 In the menu:
 - use `Refresh Now` for an immediate data refresh
@@ -67,8 +75,8 @@ Optional packaging command (for local release testing):
 ```
 
 Outputs:
-- `dist/UsageScout.app`
-- `dist/UsageScout-macOS.zip`
+- `../non-GitHub/dist/UsageScout.app` (local builds)
+- `../non-GitHub/dist/UsageScout-macOS.zip` (local builds)
 
 ## Operational Notes
 
@@ -107,9 +115,9 @@ Do not enable this mode unless you understand and accept that risk.
 Enable flow:
 1. Open the menu bar app.
 2. Open `Dashboard Auth`.
-3. Enable `Use Dashboard Auth Mode`.
-4. Choose `Auto Extract from Claude Desktop` (or manually enter values).
-5. Hit `Refresh Now`.
+3. Run `Setup Wizard...` (recommended), or enable dashboard mode directly.
+4. For desktop-based auth, use `Re-auth from Claude Desktop`.
+5. Use `Refresh Now`.
 
 Manual auth options:
 - `Enter Session Key...` (cookie value only)
@@ -144,7 +152,9 @@ UsageScout supports two modes:
 
 1. Local JSONL mode (default, approximate):
 
-`~/.claude/projects/**/*.jsonl`
+- `~/.claude/projects/**/*.jsonl`
+- `~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl`
+- `~/Library/Application Support/Claude/local-agent-mode-sessions/**/audit.jsonl`
 
 2. Optional Dashboard mode (exact values):
 - endpoint: `/api/organizations/{orgUuid}/usage`
@@ -155,7 +165,7 @@ If dashboard mode is off, UsageScout stays in local/cache mode.
 
 ## Accuracy Notes
 
-If dashboard auth is not configured or fails, UsageScout falls back to local CLI logs.
+If dashboard auth is not configured or fails, UsageScout falls back to local cache logs.
 In that mode, values can differ from Claude dashboard values because dashboard values include:
 - usage from other clients/devices
 - server-side accounting not exposed in local files

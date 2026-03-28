@@ -32,7 +32,6 @@ jobs:
           ./scripts/build_release_app.sh "${VERSION}" "${BUILD_NUMBER}"
 
       - name: Sign and notarize (optional)
-        if: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_BASE64 != '' && secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD != '' && secrets.APPLE_DEVELOPER_ID_APPLICATION_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
         shell: bash
         env:
           CERT_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_BASE64 }}
@@ -42,6 +41,11 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
+          if [[ -z "${CERT_P12_BASE64}" || -z "${CERT_P12_PASSWORD}" || -z "${SIGNING_IDENTITY}" || -z "${APPLE_ID}" || -z "${APPLE_TEAM_ID}" || -z "${APPLE_APP_SPECIFIC_PASSWORD}" ]]; then
+            echo "Signing/notarization secrets are not fully configured. Skipping."
+            exit 0
+          fi
+
           KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
           KEYCHAIN_PASSWORD="$(uuidgen)"
           CERT_PATH="$RUNNER_TEMP/cert.p12"

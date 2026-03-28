@@ -8,7 +8,12 @@ VERSION="${1:-0.9.0}"
 BUILD_NUMBER="${2:-1}"
 COPYRIGHT_TEXT="Copyright © $(date +%Y) HopIT"
 
-DIST_DIR="$ROOT_DIR/dist"
+DEFAULT_LOCAL_DIST_DIR="$(cd "$ROOT_DIR/.." && pwd)/non-GitHub/dist"
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
+else
+  DIST_DIR="${DIST_DIR:-$DEFAULT_LOCAL_DIST_DIR}"
+fi
 APP_DIR="$DIST_DIR/${APP_NAME}.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
