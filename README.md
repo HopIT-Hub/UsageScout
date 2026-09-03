@@ -3,7 +3,7 @@
 </p>
 
 > <sub>**Compliance Note (Dashboard Auth Only):**</sub>
-> <sub>`Dashboard Auth` mode, which reads `/api/organizations/{orgUuid}/usage` using your authenticated session, is a potential terms violation risk. We still have not received a written response from Anthropic, but other more visible tools appear to use the same mechanism. Our current assumption is Anthropic likely does not object to this approach. You should still treat `Dashboard Auth` as use at your own risk and a potential violation of Anthropic's Terms of Service. Core UsageScout behavior (local/cache mode) does **not** use Anthropic dashboard endpoints, but is significantly less accurate than `Dashboard Auth`.</sub>
+> <sub>`Dashboard Auth` mode, which reads `/api/organizations/{orgUuid}/usage` using your authenticated session, is a potential terms violation risk. We still have not received a written response from Anthropic, but other more visible tools appear to use the same mechanism. Our current assumption is Anthropic likely does not object to this approach. You should still treat `Dashboard Auth` as use at your own risk and a potential violation of Anthropic's Terms of Service. The default Claude Desktop plan-history source does **not** use Anthropic dashboard endpoints or require cookies.</sub>
 
 <div align="center">
 
@@ -21,6 +21,7 @@ UsageScout is a lightweight macOS menu bar app that shows:
 - next session reset time
 - current weekly usage
 - next weekly reset time
+- temporary model-specific weekly limits (for example Fable) when Dashboard Auth is enabled
 
 ## Install
 
@@ -44,7 +45,7 @@ If macOS still warns on first launch, verify:
 
 When running, a `UsageScout` item appears in the macOS menu bar.
 
-Setup flow (`Dashboard Auth > Setup Wizard...`):
+Setup flow (`Usage Source & Auth > Setup Wizard...`):
 1. Choose usage type:
 - `API (Pay As You Go)`, or
 - `Plan (Free/Pro/Max)`
@@ -53,8 +54,8 @@ Setup flow (`Dashboard Auth > Setup Wizard...`):
 - copy org UUID from request URL (`/organizations/{orgUuid}/usage`)
 - optionally auto-extract desktop cookies for dashboard mode
 3. Plan path:
-- choose dashboard auth extraction, or
-- choose ToS-compliant local/cache mode (less accurate)
+- use Claude Desktop's local plan history by default (about five-minute updates), or
+- optionally enable Dashboard Auth as an advanced fallback
 
 In the menu:
 - use `Refresh Now` for an immediate data refresh
@@ -71,8 +72,10 @@ swift run
 Optional packaging command (for local release testing):
 
 ```bash
-./scripts/build_release_app.sh 0.9.0 1
+./scripts/build_release_app.sh
 ```
+
+Without arguments, local packages use the latest Git tag as their version. Pass an explicit version and build number when needed.
 
 Outputs:
 - `../non-GitHub/dist/UsageScout.app` (local builds)
@@ -114,7 +117,7 @@ Do not enable this mode unless you understand and accept that risk.
 
 Enable flow:
 1. Open the menu bar app.
-2. Open `Dashboard Auth`.
+2. Open `Usage Source & Auth`.
 3. Run `Setup Wizard...` (recommended), or enable dashboard mode directly.
 4. For desktop-based auth, use `Re-auth from Claude Desktop`.
 5. Use `Refresh Now`.
@@ -127,6 +130,7 @@ Manual auth options:
 Automatic refresh behavior:
 - if dashboard auth fails (missing/expired key, 401/403/404, org mismatch), UsageScout attempts one auto re-extract from Claude Desktop
 - auto re-extract is rate-limited (default every 15 minutes)
+- the last valid dashboard result is retained for up to 15 minutes during transient failures
 
 Environment overrides (take precedence over saved settings):
 
@@ -148,29 +152,37 @@ export CLAUDE_ORG_UUID='xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 
 ## Data Sources
 
-UsageScout supports two modes:
+UsageScout uses three sources in priority order for Plan accounts:
 
-1. Local JSONL mode (default, approximate):
+1. Claude Desktop plan history (default):
+
+- `~/Library/Application Support/Claude/plan-usage-history.json`
+- utilization values recorded by Claude Desktop about every five minutes
+- no cookies, Keychain access, or dashboard endpoint calls required
+
+2. Optional Dashboard mode:
+
+- endpoint: `/api/organizations/{orgUuid}/usage`
+- auth from environment variables or saved app settings
+- when plan history is current, supplies reset times and model-specific limits without replacing the stable five-hour or seven-day percentages
+- when plan history is unavailable or stale, supplies the full live utilization response
+- model-specific limits are discovered dynamically from `limits[]`, with legacy Sonnet/Opus/Cowork fields retained as a compatibility fallback
+
+3. Local JSONL mode (final fallback, approximate):
 
 - `~/.claude/projects/**/*.jsonl`
 - `~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl`
 - `~/Library/Application Support/Claude/local-agent-mode-sessions/**/audit.jsonl`
 
-2. Optional Dashboard mode (exact values):
-- endpoint: `/api/organizations/{orgUuid}/usage`
-- auth from env vars or saved app settings
-- requires explicitly enabling `Dashboard Auth` mode
-
-If dashboard mode is off, UsageScout stays in local/cache mode.
-
 ## Accuracy Notes
 
-If dashboard auth is not configured or fails, UsageScout falls back to local cache logs.
-In that mode, values can differ from Claude dashboard values because dashboard values include:
+Claude Desktop plan history is authoritative plan utilization, but it can lag the live dashboard by about five minutes and stops refreshing when Claude Desktop is not running.
+
+If neither current plan history nor a recent dashboard value is available, UsageScout falls back to local JSONL logs. Those approximate values can differ from Claude dashboard values because dashboard values include:
 - usage from other clients/devices
 - server-side accounting not exposed in local files
 
-When source shows `Dashboard API (/usage)`, values should match dashboard values more closely.
+The menu always shows the active source and its update timestamp. A stale plan-history or last-known-good dashboard label means UsageScout is deliberately holding the last reliable value instead of jumping to an unrelated estimate.
 
 ## Support the Project
 

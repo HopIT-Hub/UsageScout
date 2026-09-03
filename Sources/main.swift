@@ -30,6 +30,8 @@ struct MonitorConfig {
     static let weeklySonnetBillableTokenLimit: Int = 1_500_000
     static let dashboardRequestTimeoutSeconds: TimeInterval = 10
     static let dashboardAutoExtractCooldownSeconds: TimeInterval = 900
+    static let planHistoryFreshnessSeconds: TimeInterval = 600
+    static let dashboardLastKnownGoodSeconds: TimeInterval = 900
     static let updateCheckIntervalSeconds: TimeInterval = 21_600
     static let claudeStatusCheckIntervalSeconds: TimeInterval = 300
     static let claudeStatusRequestTimeoutSeconds: TimeInterval = 8
@@ -65,13 +67,43 @@ struct DashboardLimitSummary {
     let resetAt: Date?
 }
 
+struct DashboardSecondaryLimit {
+    let displayName: String
+    let utilizationPercent: Double
+    let resetAt: Date?
+}
+
 struct DashboardUsageSummary {
     let fiveHour: DashboardLimitSummary?
     let sevenDay: DashboardLimitSummary?
-    let sevenDayOpus: DashboardLimitSummary?
-    let sevenDaySonnet: DashboardLimitSummary?
-    let sevenDayCowork: DashboardLimitSummary?
+    let secondaryLimits: [DashboardSecondaryLimit]
     let orgUUID: String
+}
+
+struct ClaudePlanUsageHistory: Decodable {
+    struct Sample: Decodable {
+        struct Utilization: Decodable {
+            let fiveHour: Double?
+            let sevenDay: Double?
+
+            enum CodingKeys: String, CodingKey {
+                case fiveHour = "fh"
+                case sevenDay = "sd"
+            }
+        }
+
+        let timestampMilliseconds: Double
+        let orgUUID: String
+        let utilization: Utilization
+
+        enum CodingKeys: String, CodingKey {
+            case timestampMilliseconds = "t"
+            case orgUUID = "org"
+            case utilization = "u"
+        }
+    }
+
+    let samples: [Sample]
 }
 
 struct UsageSnapshot {
@@ -99,6 +131,7 @@ struct MonitorSettings: Codable {
     var weeklyResetCalibrationISO8601: String?
     var onboardingCompleted: Bool?
     var onboardingMode: String?
+    var keychainPromptExplainerShown: Bool?
 }
 
 struct ClaudeStatusResponse: Decodable {
@@ -475,31 +508,48 @@ enum ClaudeDesktopCredentialExtractor {
     }
 
     private static func readSafeStoragePasswords() -> [String] {
-        let candidates: [(service: String, account: String?)] = [
-            ("Claude Safe Storage", "Claude"),
+        let context = makeKeychainContext()
+        var collected: [String] = []
+
+        let primaryCandidates: [(service: String, account: String?)] = [
             ("Claude Safe Storage", nil),
-            ("Claude Desktop Safe Storage", "Claude Desktop"),
-            ("Claude Desktop Safe Storage", nil),
-            ("Electron Safe Storage", "Claude"),
-            ("Electron Safe Storage", nil),
-            ("Chromium Safe Storage", nil),
-            ("Chrome Safe Storage", nil),
-            ("Claude", "Claude"),
-            ("Claude", nil),
-            ("Anthropic", nil)
+            ("Claude Desktop Safe Storage", nil)
         ]
 
-        var collected: [String] = []
-        for candidate in candidates {
-            if let password = findKeychainPassword(service: candidate.service, account: candidate.account),
+        for candidate in primaryCandidates {
+            if let password = findKeychainPassword(
+                service: candidate.service,
+                account: candidate.account,
+                context: context
+            ),
                !password.isEmpty,
                !collected.contains(password) {
                 collected.append(password)
+                break
             }
         }
 
-        for password in findSafeStoragePasswordsByEnumeration() where !collected.contains(password) {
-            collected.append(password)
+        if collected.isEmpty {
+            let fallbackCandidates: [(service: String, account: String?)] = [
+                ("Electron Safe Storage", nil),
+                ("Claude Safe Storage", "Claude"),
+                ("Claude Desktop Safe Storage", "Claude Desktop"),
+                ("Claude", nil),
+                ("Anthropic", nil)
+            ]
+
+            for candidate in fallbackCandidates {
+                if let password = findKeychainPassword(
+                    service: candidate.service,
+                    account: candidate.account,
+                    context: context
+                ),
+                   !password.isEmpty,
+                   !collected.contains(password) {
+                    collected.append(password)
+                    break
+                }
+            }
         }
 
         // Chromium fallback used in some environments when no keychain entry exists.
@@ -510,13 +560,17 @@ enum ClaudeDesktopCredentialExtractor {
         return collected
     }
 
-    private static func findKeychainPassword(service: String, account: String?) -> String? {
+    private static func findKeychainPassword(
+        service: String,
+        account: String?,
+        context: LAContext
+    ) -> String? {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecUseAuthenticationContext as String: makeKeychainContext()
+            kSecUseAuthenticationContext as String: context
         ]
         if let account {
             query[kSecAttrAccount as String] = account
@@ -529,59 +583,6 @@ enum ClaudeDesktopCredentialExtractor {
             return nil
         }
         return normalizeCookieValue(String(data: data, encoding: .utf8) ?? "")
-    }
-
-    private static func findSafeStoragePasswordsByEnumeration() -> [String] {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecReturnData as String: true,
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String: kSecMatchLimitAll,
-            kSecUseAuthenticationContext as String: makeKeychainContext()
-        ]
-
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess else {
-            return []
-        }
-
-        let records: [[String: Any]]
-        if let list = item as? [[String: Any]] {
-            records = list
-        } else if let single = item as? [String: Any] {
-            records = [single]
-        } else {
-            records = []
-        }
-
-        var results: [String] = []
-        for record in records {
-            let service = (record[kSecAttrService as String] as? String ?? "").lowercased()
-            let account = (record[kSecAttrAccount as String] as? String ?? "").lowercased()
-            let looksLikeSafeStorage =
-                service.contains("safe storage")
-                && (service.contains("claude")
-                    || service.contains("anthropic")
-                    || service.contains("electron")
-                    || service.contains("chrom"))
-
-            let accountLooksRelevant = account.contains("claude") || account.contains("electron")
-            guard looksLikeSafeStorage || accountLooksRelevant else {
-                continue
-            }
-
-            guard let data = record[kSecValueData as String] as? Data else {
-                continue
-            }
-
-            let normalized = normalizeCookieValue(String(data: data, encoding: .utf8) ?? "")
-            if !normalized.isEmpty, !results.contains(normalized) {
-                results.append(normalized)
-            }
-        }
-
-        return results
     }
 
     private static func makeKeychainContext() -> LAContext {
@@ -781,12 +782,30 @@ final class StartAtLoginManager {
 }
 
 final class ClaudeUsageService {
+    private struct DashboardUsageResult {
+        let summary: DashboardUsageSummary
+        let fetchedAt: Date
+        let isLastKnownGood: Bool
+    }
+
+    private struct ParsedDashboardLimits {
+        var fiveHour: DashboardLimitSummary?
+        var sevenDay: DashboardLimitSummary?
+        var secondary: [DashboardSecondaryLimit] = []
+    }
+
     private let fileManager = FileManager.default
     private let settingsStore: MonitorSettingsStore
     private let iso8601WithFractional = ISO8601DateFormatter()
     private let iso8601Basic = ISO8601DateFormatter()
     private var lastDashboardAutoExtractAttempt: Date?
-
+    private var lastSuccessfulDashboardUsage: DashboardUsageSummary?
+    private var lastSuccessfulDashboardFetchAt: Date?
+    private var cachedPlanHistorySample: (
+        modificationDate: Date,
+        requestedOrg: String?,
+        sample: ClaudePlanUsageHistory.Sample
+    )?
     private enum DashboardFetchFailure {
         case missingCookieHeader
         case missingOrgUUID
@@ -806,10 +825,28 @@ final class ClaudeUsageService {
     }
 
     func collectSnapshot(now: Date = Date()) -> UsageSnapshot {
-        if dashboardAuthModeEnabled(), let dashboard = fetchDashboardUsage() {
+        let settings = settingsStore.load()
+        let planHistorySnapshot = prefersPlanHistory(settings: settings)
+            ? collectPlanHistorySnapshot(now: now, settings: settings)
+            : nil
+
+        if let planHistorySnapshot,
+           now.timeIntervalSince(planHistorySnapshot.generatedAt) <= MonitorConfig.planHistoryFreshnessSeconds {
+            if dashboardAuthModeEnabled(settings: settings),
+               let dashboardResult = fetchDashboardUsage(now: now) {
+                return enrichPlanHistorySnapshot(
+                    planHistorySnapshot,
+                    with: dashboardResult
+                )
+            }
+            return planHistorySnapshot
+        }
+
+        if dashboardAuthModeEnabled(settings: settings), let result = fetchDashboardUsage(now: now) {
+            let dashboard = result.summary
             let weekWindow = weeklyWindow(now: now)
             return UsageSnapshot(
-                generatedAt: now,
+                generatedAt: result.fetchedAt,
                 session: nil,
                 sessionResetAt: dashboard.fiveHour?.resetAt,
                 weeklyAllUsage: TokenUsage(),
@@ -820,16 +857,178 @@ final class ClaudeUsageService {
                 scannedFileCount: 0,
                 sourcePath: "https://claude.ai/api/organizations/\(dashboard.orgUUID)/usage",
                 dashboard: dashboard,
-                sourceDescription: "Dashboard API (/usage)"
+                sourceDescription: result.isLastKnownGood
+                    ? "Dashboard API (/usage, last known good)"
+                    : "Dashboard API (/usage)"
+            )
+        }
+
+        if let planHistorySnapshot {
+            return UsageSnapshot(
+                generatedAt: planHistorySnapshot.generatedAt,
+                session: planHistorySnapshot.session,
+                sessionResetAt: planHistorySnapshot.sessionResetAt,
+                weeklyAllUsage: planHistorySnapshot.weeklyAllUsage,
+                weeklySonnetUsage: planHistorySnapshot.weeklySonnetUsage,
+                weeklySessionCount: planHistorySnapshot.weeklySessionCount,
+                weeklyStart: planHistorySnapshot.weeklyStart,
+                weeklyResetAt: planHistorySnapshot.weeklyResetAt,
+                scannedFileCount: planHistorySnapshot.scannedFileCount,
+                sourcePath: planHistorySnapshot.sourcePath,
+                dashboard: planHistorySnapshot.dashboard,
+                sourceDescription: "Claude Desktop plan history (stale)"
             )
         }
 
         return collectLocalSnapshot(now: now)
     }
 
-    private func dashboardAuthModeEnabled() -> Bool {
-        let settings = settingsStore.load()
+    private func enrichPlanHistorySnapshot(
+        _ snapshot: UsageSnapshot,
+        with dashboardResult: DashboardUsageResult
+    ) -> UsageSnapshot {
+        guard let history = snapshot.dashboard else {
+            return snapshot
+        }
+
+        let live = dashboardResult.summary
+        let enriched = DashboardUsageSummary(
+            fiveHour: history.fiveHour.map {
+                DashboardLimitSummary(
+                    utilizationPercent: $0.utilizationPercent,
+                    resetAt: live.fiveHour?.resetAt ?? $0.resetAt
+                )
+            },
+            sevenDay: history.sevenDay.map {
+                DashboardLimitSummary(
+                    utilizationPercent: $0.utilizationPercent,
+                    resetAt: live.sevenDay?.resetAt ?? $0.resetAt
+                )
+            },
+            secondaryLimits: live.secondaryLimits,
+            orgUUID: history.orgUUID
+        )
+
+        return UsageSnapshot(
+            generatedAt: snapshot.generatedAt,
+            session: snapshot.session,
+            sessionResetAt: enriched.fiveHour?.resetAt ?? snapshot.sessionResetAt,
+            weeklyAllUsage: snapshot.weeklyAllUsage,
+            weeklySonnetUsage: snapshot.weeklySonnetUsage,
+            weeklySessionCount: snapshot.weeklySessionCount,
+            weeklyStart: snapshot.weeklyStart,
+            weeklyResetAt: enriched.sevenDay?.resetAt ?? snapshot.weeklyResetAt,
+            scannedFileCount: snapshot.scannedFileCount,
+            sourcePath: snapshot.sourcePath,
+            dashboard: enriched,
+            sourceDescription: dashboardResult.isLastKnownGood
+                ? "Claude Desktop plan history + saved dashboard reset times"
+                : "Claude Desktop plan history + dashboard reset times"
+        )
+    }
+
+    private func dashboardAuthModeEnabled(settings: MonitorSettings) -> Bool {
         return settings.dashboardAuthEnabled ?? false
+    }
+
+    private func prefersPlanHistory(settings: MonitorSettings) -> Bool {
+        settings.onboardingMode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "api"
+    }
+
+    private func collectPlanHistorySnapshot(now: Date, settings: MonitorSettings) -> UsageSnapshot? {
+        let historyURL = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library")
+            .appendingPathComponent("Application Support")
+            .appendingPathComponent("Claude")
+            .appendingPathComponent("plan-usage-history.json")
+
+        let savedOrg = settings.orgUUID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let modificationDate = (try? historyURL.resourceValues(forKeys: [.contentModificationDateKey]))?
+            .contentModificationDate
+            ?? cachedPlanHistorySample?.modificationDate
+        guard let modificationDate,
+              let sample = latestPlanHistorySample(
+                at: historyURL,
+                modificationDate: modificationDate,
+                requestedOrg: savedOrg
+              ) else {
+            return nil
+        }
+
+        let fiveHour = sample.utilization.fiveHour.map {
+            DashboardLimitSummary(utilizationPercent: max(0, min(100, $0)), resetAt: nil)
+        }
+        let sevenDay = sample.utilization.sevenDay.map {
+            DashboardLimitSummary(utilizationPercent: max(0, min(100, $0)), resetAt: nil)
+        }
+        guard fiveHour != nil || sevenDay != nil else {
+            return nil
+        }
+
+        let sampleDate = Date(timeIntervalSince1970: sample.timestampMilliseconds / 1_000)
+        let weekWindow = weeklyWindow(now: now, settings: settings)
+        let sessionResetAt = calibratedResetDate(
+            fromISO8601: settings.sessionResetCalibrationISO8601,
+            intervalSeconds: TimeInterval(MonitorConfig.sessionWindowHours * 3_600),
+            now: now
+        )
+
+        return UsageSnapshot(
+            generatedAt: sampleDate,
+            session: nil,
+            sessionResetAt: sessionResetAt,
+            weeklyAllUsage: TokenUsage(),
+            weeklySonnetUsage: TokenUsage(),
+            weeklySessionCount: 0,
+            weeklyStart: weekWindow.start,
+            weeklyResetAt: weekWindow.nextReset,
+            scannedFileCount: 0,
+            sourcePath: historyURL.path,
+            dashboard: DashboardUsageSummary(
+                fiveHour: fiveHour,
+                sevenDay: sevenDay,
+                secondaryLimits: [],
+                orgUUID: sample.orgUUID
+            ),
+            sourceDescription: "Claude Desktop plan history (5-minute cache)"
+        )
+    }
+
+    private func latestPlanHistorySample(
+        at historyURL: URL,
+        modificationDate: Date,
+        requestedOrg: String?
+    ) -> ClaudePlanUsageHistory.Sample? {
+        if let cached = cachedPlanHistorySample,
+           cached.modificationDate == modificationDate,
+           cached.requestedOrg == requestedOrg {
+            return cached.sample
+        }
+
+        guard let data = try? Data(contentsOf: historyURL),
+              let history = try? JSONDecoder().decode(ClaudePlanUsageHistory.self, from: data),
+              !history.samples.isEmpty else {
+            if let cached = cachedPlanHistorySample,
+               cached.requestedOrg == requestedOrg {
+                return cached.sample
+            }
+            return nil
+        }
+
+        let matchingSamples = requestedOrg.map { org in
+            history.samples.filter { $0.orgUUID.lowercased() == org }
+        } ?? history.samples
+        guard let sample = (matchingSamples.isEmpty ? history.samples : matchingSamples)
+            .max(by: { $0.timestampMilliseconds < $1.timestampMilliseconds }) else {
+            return nil
+        }
+
+        cachedPlanHistorySample = (
+            modificationDate: modificationDate,
+            requestedOrg: requestedOrg,
+            sample: sample
+        )
+        return sample
     }
 
     private func collectLocalSnapshot(now: Date) -> UsageSnapshot {
@@ -945,23 +1144,40 @@ final class ClaudeUsageService {
         )
     }
 
-    private func fetchDashboardUsage() -> DashboardUsageSummary? {
+    private func fetchDashboardUsage(now: Date) -> DashboardUsageResult? {
         switch requestDashboardUsage() {
         case .success(let dashboard):
-            return dashboard
+            return rememberDashboardUsage(dashboard, fetchedAt: now)
         case .failure(let firstFailure):
-            guard shouldAutoReextract(for: firstFailure),
-                  autoReextractDashboardCredentials() else {
-                return nil
+            if shouldAutoReextract(for: firstFailure),
+               autoReextractDashboardCredentials() {
+                switch requestDashboardUsage() {
+                case .success(let dashboard):
+                    return rememberDashboardUsage(dashboard, fetchedAt: now)
+                case .failure:
+                    break
+                }
             }
-
-            switch requestDashboardUsage() {
-            case .success(let dashboard):
-                return dashboard
-            case .failure:
-                return nil
-            }
+            return lastKnownGoodDashboardUsage(now: now)
         }
+    }
+
+    private func rememberDashboardUsage(
+        _ dashboard: DashboardUsageSummary,
+        fetchedAt: Date
+    ) -> DashboardUsageResult {
+        lastSuccessfulDashboardUsage = dashboard
+        lastSuccessfulDashboardFetchAt = fetchedAt
+        return DashboardUsageResult(summary: dashboard, fetchedAt: fetchedAt, isLastKnownGood: false)
+    }
+
+    private func lastKnownGoodDashboardUsage(now: Date) -> DashboardUsageResult? {
+        guard let dashboard = lastSuccessfulDashboardUsage,
+              let fetchedAt = lastSuccessfulDashboardFetchAt,
+              now.timeIntervalSince(fetchedAt) <= MonitorConfig.dashboardLastKnownGoodSeconds else {
+            return nil
+        }
+        return DashboardUsageResult(summary: dashboard, fetchedAt: fetchedAt, isLastKnownGood: true)
     }
 
     private func requestDashboardUsage() -> DashboardFetchResult {
@@ -1009,18 +1225,36 @@ final class ClaudeUsageService {
             return .failure(.invalidPayload)
         }
 
+        let canonical = parseCanonicalDashboardLimits(object["limits"])
+        let secondary = mergeSecondaryLimits(
+            canonical.secondary,
+            legacySecondaryLimits(from: object)
+        )
         let summary = DashboardUsageSummary(
-            fiveHour: parseDashboardLimit(object["five_hour"]),
-            sevenDay: parseDashboardLimit(object["seven_day"]),
-            sevenDayOpus: parseDashboardLimit(object["seven_day_opus"]),
-            sevenDaySonnet: parseDashboardLimit(object["seven_day_sonnet"]),
-            sevenDayCowork: parseDashboardLimit(object["seven_day_cowork"]),
+            fiveHour: canonical.fiveHour ?? parseDashboardLimit(object["five_hour"]),
+            sevenDay: canonical.sevenDay ?? parseDashboardLimit(object["seven_day"]),
+            secondaryLimits: secondary,
             orgUUID: orgUUID
         )
+        guard summary.fiveHour != nil
+                || summary.sevenDay != nil
+                || !summary.secondaryLimits.isEmpty else {
+            return .failure(.invalidPayload)
+        }
         return .success(summary)
     }
 
     private func shouldAutoReextract(for failure: DashboardFetchFailure) -> Bool {
+        let settings = settingsStore.load()
+        if (settings.dashboardAuthEnabled ?? false) == false {
+            return false
+        }
+
+        // Avoid silent first-use prompts before the user has seen the explainer.
+        if (settings.keychainPromptExplainerShown ?? false) == false {
+            return false
+        }
+
         let env = ProcessInfo.processInfo.environment
         let hasEnvAuth = (env["CLAUDE_COOKIE_HEADER"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
             || (env["CLAUDE_SESSION_KEY"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
@@ -1051,7 +1285,9 @@ final class ClaudeUsageService {
             var settings = settingsStore.load()
             settings.sessionKey = creds.sessionKey
             settings.cookieHeader = nil
-            settings.orgUUID = creds.orgUUID?.lowercased()
+            if let orgUUID = creds.orgUUID {
+                settings.orgUUID = orgUUID.lowercased()
+            }
             settingsStore.save(settings)
             return true
         case .failure:
@@ -1079,6 +1315,83 @@ final class ClaudeUsageService {
             utilizationPercent: max(0.0, min(100.0, utilization)),
             resetAt: resetAt
         )
+    }
+
+    private func parseCanonicalDashboardLimits(_ raw: Any?) -> ParsedDashboardLimits {
+        guard let entries = raw as? [[String: Any]] else {
+            return ParsedDashboardLimits()
+        }
+
+        var parsed = ParsedDashboardLimits()
+        for entry in entries {
+            guard let kind = entry["kind"] as? String,
+                  let percent = doubleValue(from: entry["percent"]) else {
+                continue
+            }
+
+            let resetAt = (entry["resets_at"] as? String).flatMap(parseTimestamp)
+            let limit = DashboardLimitSummary(
+                utilizationPercent: max(0, min(100, percent)),
+                resetAt: resetAt
+            )
+
+            switch kind {
+            case "session":
+                parsed.fiveHour = limit
+            case "weekly_all":
+                parsed.sevenDay = limit
+            default:
+                guard let scope = entry["scope"] as? [String: Any],
+                      let model = scope["model"] as? [String: Any],
+                      let displayName = (model["display_name"] as? String)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                      !displayName.isEmpty else {
+                    continue
+                }
+                parsed.secondary.append(
+                    DashboardSecondaryLimit(
+                        displayName: displayName,
+                        utilizationPercent: limit.utilizationPercent,
+                        resetAt: limit.resetAt
+                    )
+                )
+            }
+        }
+        return parsed
+    }
+
+    private func legacySecondaryLimits(from object: [String: Any]) -> [DashboardSecondaryLimit] {
+        let legacyFields: [(key: String, displayName: String)] = [
+            ("seven_day_opus", "Opus"),
+            ("seven_day_sonnet", "Sonnet"),
+            ("seven_day_cowork", "Cowork")
+        ]
+
+        return legacyFields.compactMap { field in
+            guard let limit = parseDashboardLimit(object[field.key]) else {
+                return nil
+            }
+            return DashboardSecondaryLimit(
+                displayName: field.displayName,
+                utilizationPercent: limit.utilizationPercent,
+                resetAt: limit.resetAt
+            )
+        }
+    }
+
+    private func mergeSecondaryLimits(
+        _ preferred: [DashboardSecondaryLimit],
+        _ fallback: [DashboardSecondaryLimit]
+    ) -> [DashboardSecondaryLimit] {
+        var seen = Set<String>()
+        var merged: [DashboardSecondaryLimit] = []
+        for limit in preferred + fallback {
+            let key = limit.displayName.lowercased()
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            merged.append(limit)
+        }
+        return merged
     }
 
     private func resolvedCookieHeader() -> String? {
@@ -1517,7 +1830,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
     private enum UserProfile: Equatable {
         case api
         case planDashboard
-        case planCache
+        case planHistory
         case unknown
     }
 
@@ -1714,6 +2027,10 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         _ = openClaudeUsagePageForOrgLookup(showConfirmation: false)
     }
 
+    @objc private func explainKeychainPromptsAction(_ sender: Any?) {
+        _ = presentKeychainPromptExplainer(forceDisplay: true, requireConfirmation: false)
+    }
+
     @objc private func toggleStartAtLoginAction(_ sender: Any?) {
         let state = startAtLoginManager.currentState()
         guard state.canToggle else {
@@ -1749,6 +2066,10 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
     }
 
     @objc private func autoExtractDashboardAuthAction(_ sender: Any?) {
+        guard presentKeychainPromptExplainer(forceDisplay: false, requireConfirmation: true) else {
+            return
+        }
+
         let extraction = ClaudeDesktopCredentialExtractor.extractDetailed()
         let extracted: DashboardCredentials
         switch extraction {
@@ -1793,6 +2114,50 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         return "Auto-extract uses Claude Desktop cookies at \(claudeDesktopPath). Install Claude Desktop, sign in, and open it once, then retry.\n\nIf you are CLI-only, use cache-only mode or enter session/cookie values manually."
     }
 
+    private func presentKeychainPromptExplainer(
+        forceDisplay: Bool,
+        requireConfirmation: Bool
+    ) -> Bool {
+        var settings = settingsStore.load()
+        let alreadyShown = settings.keychainPromptExplainerShown ?? false
+        if !forceDisplay, requireConfirmation, alreadyShown {
+            return true
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "Before Cookie Extraction"
+        alert.informativeText = """
+        UsageScout needs temporary access to Claude Desktop's Safe Storage key so it can decrypt your local session cookie for Dashboard Auth.
+
+        What to expect:
+        • Usually 1 keychain permission dialog (sometimes up to 2-3 depending on your setup).
+        • You may also see a macOS password/Touch ID prompt.
+        • If you choose Always Allow, future prompts are usually reduced or removed on this Mac.
+        """
+        alert.alertStyle = .informational
+
+        if requireConfirmation {
+            alert.addButton(withTitle: "Continue")
+            alert.addButton(withTitle: "Cancel")
+        } else {
+            alert.addButton(withTitle: "OK")
+        }
+
+        let response = alert.runModal()
+        if requireConfirmation, response != .alertFirstButtonReturn {
+            return false
+        }
+
+        if !alreadyShown {
+            settings.keychainPromptExplainerShown = true
+            settingsStore.save(settings)
+        }
+
+        return true
+    }
+
     private func presentSetupWizardIfNeeded() {
         guard !hasPresentedSetupWizardThisLaunch else { return }
         let settings = settingsStore.load()
@@ -1810,7 +2175,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         let selection = runWizardDialog(
             title: "How do you use Claude?",
             message: "Choose your primary usage type for UsageScout setup.",
-            detail: "You can run this again anytime from Dashboard Auth > Setup Wizard.",
+            detail: "You can run this again anytime from Usage Source & Auth > Setup Wizard.",
             actions: [
                 WizardDialogAction(title: "API (Pay As You Go)", style: .primary),
                 WizardDialogAction(title: "Plan (Free/Pro/Max)", style: .secondary),
@@ -1873,6 +2238,12 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         settings.onboardingCompleted = true
         settings.onboardingMode = "api"
 
+        guard presentKeychainPromptExplainer(forceDisplay: false, requireConfirmation: true) else {
+            settingsStore.save(settings)
+            refreshData()
+            return
+        }
+
         let extraction = ClaudeDesktopCredentialExtractor.extractDetailed()
         switch extraction {
         case .success(let creds):
@@ -1902,10 +2273,11 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
     private func runPlanOnboarding(existingSettings: MonitorSettings) {
         let selection = runWizardDialog(
             title: "Plan Monitoring Options",
-            message: "Monitoring usage may not be ToS compliant. Anthropic has not responded to our request for clarification.",
+            message: "Claude Desktop records your plan utilization locally about every five minutes. UsageScout can read that file without cookies or Keychain access.",
+            detail: "Dashboard Auth can refresh more directly, but may not be ToS compliant. Anthropic has not responded to our request for clarification.",
             actions: [
-                WizardDialogAction(title: "Extract Cookies (Dashboard Auth)", style: .primary),
-                WizardDialogAction(title: "Use ToS Compliant Cache Monitoring", style: .secondary),
+                WizardDialogAction(title: "Use Claude Desktop Plan History", style: .primary),
+                WizardDialogAction(title: "Use Dashboard Auth (Advanced)", style: .secondary),
                 WizardDialogAction(title: "Cancel", style: .secondary)
             ]
         )
@@ -1913,6 +2285,32 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         switch selection {
         case 0:
             var settings = settingsStore.load()
+            settings.dashboardAuthEnabled = false
+            settings.onboardingCompleted = true
+            settings.onboardingMode = "plan_history"
+            if settings.orgUUID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+                settings.orgUUID = existingSettings.orgUUID
+            }
+            settingsStore.save(settings)
+
+            let historyPath = URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Library")
+                .appendingPathComponent("Application Support")
+                .appendingPathComponent("Claude")
+                .appendingPathComponent("plan-usage-history.json")
+                .path
+            let historyFound = FileManager.default.fileExists(atPath: historyPath)
+            showAlert(
+                title: historyFound ? "Plan History Monitoring Enabled" : "Plan History Not Found Yet",
+                message: historyFound
+                    ? "UsageScout will use Claude Desktop's locally recorded plan utilization. It normally updates about every five minutes."
+                    : "UsageScout will watch for Claude Desktop's plan usage history. Open Claude Desktop and use Claude once to create or refresh it; approximate local logs will be used until then."
+            )
+        case 1:
+            var settings = settingsStore.load()
+            guard presentKeychainPromptExplainer(forceDisplay: false, requireConfirmation: true) else {
+                return
+            }
             let extraction = ClaudeDesktopCredentialExtractor.extractDetailed()
             switch extraction {
             case .success(let creds):
@@ -1937,22 +2335,9 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
                 }
                 showAlert(
                     title: "Cookie Extraction Failed",
-                    message: "UsageScout stayed in cache-only mode.\n\nYou can retry from Dashboard Auth > Setup Wizard.\n\nDetails: \(reason)\n\n\(cookieExtractionHelpText())"
+                    message: "UsageScout stayed with local plan history.\n\nYou can retry from Usage Source & Auth > Setup Wizard.\n\nDetails: \(reason)\n\n\(cookieExtractionHelpText())"
                 )
             }
-        case 1:
-            var settings = settingsStore.load()
-            settings.dashboardAuthEnabled = false
-            settings.onboardingCompleted = true
-            settings.onboardingMode = "plan_cache"
-            if settings.orgUUID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
-                settings.orgUUID = existingSettings.orgUUID
-            }
-            settingsStore.save(settings)
-            showAlert(
-                title: "Cache-Only Mode Enabled",
-                message: "UsageScout will use local cache/log monitoring. This is less accurate, but avoids dashboard auth."
-            )
         default:
             break
         }
@@ -2018,17 +2403,21 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         }
 
         settings.dashboardAuthEnabled = nextValue
+        let currentMode = settings.onboardingMode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if currentMode != "api" {
+            settings.onboardingMode = nextValue ? "plan_dashboard" : "plan_history"
+        }
         settingsStore.save(settings)
 
         if nextValue {
             showAlert(
                 title: "Dashboard Auth Enabled",
-                message: "UsageScout will now attempt dashboard API reads when credentials are available. Use this mode at your own risk."
+                message: "UsageScout will keep Claude Desktop plan history as the primary source and use Dashboard Auth when local history is unavailable or stale. Use Dashboard Auth at your own risk."
             )
         } else {
             showAlert(
-                title: "Cache-Only Mode Enabled",
-                message: "UsageScout will now use local cache/log data only."
+                title: "Local Plan History Enabled",
+                message: "UsageScout will now prefer Claude Desktop's local plan history and use approximate logs only when needed."
             )
         }
 
@@ -2232,13 +2621,10 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
                 limit: MonitorConfig.weeklyAllBillableTokenLimit
             )
 
-        let weeklySonnetRatio = snapshot.dashboard
-            .flatMap { $0.sevenDaySonnet }
-            .map { max(0.0, min(1.0, $0.utilizationPercent / 100.0)) }
-            ?? progressRatio(
-                used: snapshot.weeklySonnetUsage.billable,
-                limit: MonitorConfig.weeklySonnetBillableTokenLimit
-            )
+        let weeklySonnetRatio = progressRatio(
+            used: snapshot.weeklySonnetUsage.billable,
+            limit: MonitorConfig.weeklySonnetBillableTokenLimit
+        )
 
         if snapshot.dashboard?.fiveHour != nil || snapshot.session != nil {
             statusItem.button?.image = statusProgressImage(sessionRatio)
@@ -2256,7 +2642,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
             } else {
                 menu.addItem(disabledItem("Usage data unavailable"))
             }
-            if let reset = dashboard.fiveHour?.resetAt {
+            if let reset = dashboard.fiveHour?.resetAt ?? snapshot.sessionResetAt {
                 menu.addItem(disabledItem("Session reset: \(countdown(until: reset))"))
                 menu.addItem(disabledItem("Resets at: \(absoluteDateFormatter.string(from: reset))"))
             }
@@ -2285,18 +2671,15 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
             if dashboard.sevenDay != nil {
                 menu.addItem(disabledItem("All models: \(progressBar(weeklyAllRatio)) \(percentText(weeklyAllRatio))"))
             }
-            if dashboard.sevenDaySonnet != nil {
-                menu.addItem(disabledItem("Sonnet only: \(progressBar(weeklySonnetRatio)) \(percentText(weeklySonnetRatio))"))
+            for limit in dashboard.secondaryLimits {
+                let ratio = max(0.0, min(1.0, limit.utilizationPercent / 100.0))
+                menu.addItem(disabledItem("\(limit.displayName) only: \(progressBar(ratio)) \(percentText(ratio))"))
+                if let resetAt = limit.resetAt {
+                    menu.addItem(disabledItem("\(limit.displayName) reset: \(countdown(until: resetAt))"))
+                }
             }
-            if let opus = dashboard.sevenDayOpus {
-                let ratio = max(0.0, min(1.0, opus.utilizationPercent / 100.0))
-                menu.addItem(disabledItem("Opus only: \(progressBar(ratio)) \(percentText(ratio))"))
-            }
-            if let cowork = dashboard.sevenDayCowork {
-                let ratio = max(0.0, min(1.0, cowork.utilizationPercent / 100.0))
-                menu.addItem(disabledItem("Cowork only: \(progressBar(ratio)) \(percentText(ratio))"))
-            }
-            if let weeklyReset = dashboard.sevenDay?.resetAt ?? dashboard.sevenDaySonnet?.resetAt {
+            if let weeklyReset = dashboard.sevenDay?.resetAt
+                ?? parsedStoredDate(settingsStore.load().weeklyResetCalibrationISO8601) {
                 menu.addItem(disabledItem("Weekly reset: \(countdown(until: weeklyReset))"))
                 menu.addItem(disabledItem("Resets at: \(absoluteDateFormatter.string(from: weeklyReset))"))
             }
@@ -2327,8 +2710,8 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         let authStatus = dashboardAuthStatus(settings: settings)
         menu.addItem(disabledItem("Auth: \(authStatus)"))
 
-        let authItem = NSMenuItem(title: "Dashboard Auth", action: nil, keyEquivalent: "")
-        let authMenu = NSMenu(title: "Dashboard Auth")
+        let authItem = NSMenuItem(title: "Usage Source & Auth", action: nil, keyEquivalent: "")
+        let authMenu = NSMenu(title: "Usage Source & Auth")
         let profile = userProfile(from: settings)
         let dashboardModeEnabled = settings.dashboardAuthEnabled ?? false
 
@@ -2340,11 +2723,15 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         openUsagePageItem.target = self
         authMenu.addItem(openUsagePageItem)
 
+        let keychainInfoItem = NSMenuItem(title: "Why Keychain Prompts?", action: #selector(explainKeychainPromptsAction(_:)), keyEquivalent: "")
+        keychainInfoItem.target = self
+        authMenu.addItem(keychainInfoItem)
+
         authMenu.addItem(.separator())
 
         let toggleTitle: String
         if dashboardModeEnabled {
-            toggleTitle = "Disable Dashboard Auth (Use Cache-Only)"
+            toggleTitle = "Disable Dashboard Auth (Use Plan History)"
         } else if profile == .api {
             toggleTitle = "Enable Dashboard Auth Mode"
         } else {
@@ -2358,9 +2745,9 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         case .api:
             authMenu.addItem(disabledItem("Profile: API (Pay As You Go)"))
         case .planDashboard:
-            authMenu.addItem(disabledItem("Profile: Plan (Dashboard Auth)"))
-        case .planCache:
-            authMenu.addItem(disabledItem("Profile: Plan (Cache-Only)"))
+            authMenu.addItem(disabledItem("Profile: Plan (History + Dashboard Backup)"))
+        case .planHistory:
+            authMenu.addItem(disabledItem("Profile: Plan (Desktop History)"))
         case .unknown:
             authMenu.addItem(disabledItem(dashboardModeEnabled ? "Mode: dashboard auth enabled" : "Mode: cache-only"))
         }
@@ -2412,7 +2799,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         if !dashboardModeEnabled {
             let calibrationItem = NSMenuItem(title: "Reset Calibration", action: nil, keyEquivalent: "")
             let calibrationMenu = NSMenu(title: "Reset Calibration")
-            calibrationMenu.addItem(disabledItem("Local/cache mode only"))
+            calibrationMenu.addItem(disabledItem("Plan history/local mode"))
             if let sessionCalibration = parsedStoredDate(settings.sessionResetCalibrationISO8601) {
                 calibrationMenu.addItem(disabledItem("Session anchor: \(absoluteDateFormatter.string(from: sessionCalibration))"))
             }
@@ -2804,7 +3191,11 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
 
     private func dashboardAuthStatus(settings: MonitorSettings) -> String {
         if (settings.dashboardAuthEnabled ?? false) == false {
-            return "disabled (cache-only)"
+            let mode = settings.onboardingMode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if mode == "plan_history" || mode == "plan_cache" {
+                return "not required (Claude Desktop plan history)"
+            }
+            return "disabled (local sources)"
         }
 
         let env = ProcessInfo.processInfo.environment
@@ -2830,8 +3221,8 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
                 return .api
             case "plan_dashboard":
                 return .planDashboard
-            case "plan_cache":
-                return .planCache
+            case "plan_history", "plan_cache":
+                return .planHistory
             default:
                 break
             }
@@ -2840,7 +3231,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate {
         if settings.dashboardAuthEnabled ?? false {
             return .unknown
         }
-        return .planCache
+        return .planHistory
     }
 
     private func parsedStoredDate(_ value: String?) -> Date? {

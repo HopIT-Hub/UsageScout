@@ -4,7 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="UsageScout"
 BUNDLE_ID="com.hopit.usagescout"
-VERSION="${1:-0.9.0}"
+LATEST_TAG="$(git -C "$ROOT_DIR" describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+DEFAULT_VERSION="${LATEST_TAG#v}"
+VERSION="${1:-${DEFAULT_VERSION:-0.0.0-dev}}"
 BUILD_NUMBER="${2:-1}"
 COPYRIGHT_TEXT="Copyright © $(date +%Y) HopIT"
 
@@ -99,6 +101,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<EOF
 </dict>
 </plist>
 EOF
+
+codesign --force --sign - "$APP_DIR"
 
 rm -f "$ZIP_PATH"
 ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP_PATH"
